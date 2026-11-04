@@ -1,3 +1,7 @@
+> **Ovia Inc fork — modification reference.** We maintain this fork of [a2ui-project/a2ui](https://github.com/a2ui-project/a2ui). **Modifications by Ovia Inc:** this reference note, added November 2026 as part of the collection-wide documentation pass; the expanded Ovia README treatment (Ovia section, story, topics and description) follows in the daily improvement queue. Upstream code and content are otherwise unchanged from the fork point, except where a later commit in this repository says so. Upstream credit: a2ui-project. Licence: Apache-2.0 (see LICENSE where present).
+
+---
+
 # A2UI: Agent-to-User Interface
 
 A2UI is an open-source project, complete with a format
