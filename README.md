@@ -1,4 +1,61 @@
-> **Ovia Inc fork — modification reference.** We maintain this fork of [a2ui-project/a2ui](https://github.com/a2ui-project/a2ui). **Modifications by Ovia Inc:** this reference note, added November 2026 as part of the collection-wide documentation pass; the expanded Ovia README treatment (Ovia section, story, topics and description) follows in the daily improvement queue. Upstream code and content are otherwise unchanged from the fork point, except where a later commit in this repository says so. Upstream credit: a2ui-project. Licence: Apache-2.0 (see LICENSE where present).
+# Ovia Inc — A2UI (fork of a2ui-project/a2ui)
+
+<img src="docs/public/assets/a2ui_gallery_examples.png" alt="Ovia Inc — gallery of A2UI rendered cards from the upstream project assets, showing a variety of agent-generated interface compositions" width="100%"/>
+
+We maintain this fork of [a2ui-project/a2ui](https://github.com/a2ui-project/a2ui), the open-source Agent-to-User Interface project. Upstream credit: the a2ui-project team and contributors. Licence: Apache-2.0 (see LICENSE), preserved as received.
+
+**Our main site:** https://oviainc.github.io/ai-services/
+
+**Upstream project site:** https://a2ui.org/
+
+## What this is
+
+A2UI gives agents a way to present rich, interactive interfaces instead of plain text alone. An agent sends a declarative JSON description of the interface intent — a flat list of components with data binding — and the client application renders that description with trusted native components from a pre-approved catalog. The upstream description sums the result up as safe like data, but expressive like code: no arbitrary generated code runs in the client, and the same payload can render across frameworks.
+
+The repository carries the specification and the surrounding implementation surface: renderers and client work for web and mobile frameworks — upstream lists React, Angular, Lit, Flutter, SwiftUI and Jetpack Compose — agent SDKs, catalogs, blueprints, conformance material, documentation, and worked examples, including a restaurant finder quickstart and tools for composing and stepping through A2UI payloads. At the fork point, upstream described the production release as v0.9.1 in the stable v0.9 protocol family, with the v1.0 specification as a release candidate and v0.8 as legacy, and the project as an early-stage public preview with an evolving specification.
+
+## Story
+
+Upstream opened the project under the a2ui-project organization on September 24, 2025, to solve a concrete gap in agent work: models handle text and code well, while rich presentation — forms, cards, dashboards, approvals — is harder, especially when an agent is remote or crosses a trust boundary. The design answers that gap with four commitments set out in the upstream README: security first through a declarative format and a trusted component catalog, an LLM-friendly flat component model that can update incrementally and render progressively, framework-agnostic portability from a single payload, and an open registry that lets developers map server-side types to custom client components with sandboxing under developer control.
+
+We forked the project into the Oviainc collection on September 17, 2026, at the September 16, 2026 upstream snapshot. The fork sits in our collection in the coding-agent tooling group, beside the terminal, context, and database tooling forks we evaluate side by side. Where those projects run an agent or feed an agent, this one covers the last step in the chain: how an agent shows work to a person and asks a person for the next input, as a real interface rather than a wall of text.
+
+What we evaluate here is the protocol and the rendering model — how a declarative payload stays expressive without becoming executable code, how a component catalog and registry keep trust with the client developer, how incremental updates and data binding behave in a live conversation, and how one payload carries across web, desktop, and mobile renderers. Transport fit also matters: upstream describes compatibility with agent-to-agent and agent-user protocols, and generation by any model that can produce JSON.
+
+Where the project fits our work:
+
+- **AI agents** — the core fit. Agent services need a presentation layer: approvals, forms, status, and results a person can act on. A2UI is a leading open candidate for that layer.
+- **Context engineering** — an interface payload is context made visible: the components, values, and choices presented shape what a person reviews and what returns to the agent. Catalog design and incremental updates are context decisions.
+- **Business intelligence and data** — dashboards and data collection are named upstream use cases: an agent generates an approval view or a visualization from a query, and a bespoke form gathers the exact inputs a workflow needs. Both map directly to BI delivery.
+- **Virtual production** — production review, asset selection, and sign-off are interface-heavy, often remote, and cross tools on different frameworks. A portable, declarative interface format that renders natively on each client fits that shape of work.
+
+## Modifications by Ovia Inc
+
+Documentation only. Upstream code and content are unchanged from the fork point, except for documentation notes added in November 2026: a modification reference on November 4, 2026, replaced by this expanded treatment (Ovia section, story, and picture) on November 10, 2026. Where a later commit in this repository says otherwise, that commit governs.
+
+## Sync status
+
+This fork carries documentation commits of our own on top of the September 16, 2026 fork-point snapshot (upstream commit 0086493, "clarify spec"), and upstream is 664 commits ahead at the time of this pass, with the production line and the v1.0 specification work still moving. No sync has been applied on this pass: with a specification still stabilizing and renderer work moving quickly, a sync is a deliberate step, taken after a review of what changed in the protocol and the renderers, rather than an automatic merge — and the fork's value as an evaluation reference depends on knowing exactly which snapshot is under review. The upstream README below is the fork-point version, preserved as received.
+
+## Related repositories
+
+- [ai-services](https://github.com/Oviainc/ai-services) — our flagship site: AI agents, machine learning in production, and AI products for business
+- [antigravity-cli-ovia-inc](https://github.com/Oviainc/antigravity-cli-ovia-inc) — the terminal surface of a vendor agent harness, from the same tooling group
+- [Graft-ovia-inc](https://github.com/Oviainc/Graft-ovia-inc) — a local context graph for coding agents, from the same tooling group
+- [agents-cli-ovia-inc-studio-labs](https://github.com/Oviainc/agents-cli-ovia-inc-studio-labs) — the CLI and skills for building, evaluating, and deploying agents, evaluated alongside this fork
+- [mcp-toolbox-ovia-inc](https://github.com/Oviainc/mcp-toolbox-ovia-inc) — a toolbox that connects agents to databases, from the same tooling group
+
+## Working with us
+
+Start from our site: https://oviainc.github.io/ai-services/ — the contact form there is the fastest way to reach us.
+
+## Licence
+
+Apache-2.0. See LICENSE in this repository. The licence stands as received, and upstream credit remains with the upstream contributors.
+
+---
+
+Ovia Inc — Artificial Intelligence & Context Engineering. Based in Canada, working wherever the work is.
 
 ---
 
