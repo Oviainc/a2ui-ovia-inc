@@ -22,7 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 
 def resolve_results_file(target_path: str) -> str:
@@ -125,8 +125,8 @@ def extract_metrics(
     json_path: str,
     label_name: str = "",
     use_median: bool = True,
-    filter_sample_ids: Optional[Set[str]] = None,
-) -> Dict[str, Any]:
+    filter_sample_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Extracts summary and per-sample metrics from an evaluation results JSON file.
 
     Args:
@@ -414,14 +414,14 @@ def extract_metrics(
     )
 
     # Fallback stats model usage if sample metadata is empty
-    model_usage: Dict[str, Any] = (data.get("stats") or {}).get("model_usage") or {}
-    primary_usage: Dict[str, Any] = (
+    model_usage: dict[str, Any] = (data.get("stats") or {}).get("model_usage") or {}
+    primary_usage: dict[str, Any] = (
         next(iter(model_usage.values()), {}) if model_usage else {}
     )
 
     import statistics
 
-    def _calc_stat(lst: List[float], fallback: float = 0.0) -> float:
+    def _calc_stat(lst: list[float], fallback: float = 0.0) -> float:
         if not lst:
             return fallback
         return float(statistics.median(lst)) if use_median else (sum(lst) / len(lst))
@@ -431,7 +431,8 @@ def extract_metrics(
         input_tokens, primary_usage.get("input_tokens", 0) / max(sample_count, 1)
     )
     avg_output_tokens = _calc_stat(
-        output_tokens, primary_usage.get("output_tokens", 0) / max(sample_count, 1)
+        output_tokens,
+        primary_usage.get("output_tokens", 0) / max(sample_count, 1),
     )
     avg_cached_tokens = _calc_stat(
         cached_tokens,
@@ -508,7 +509,7 @@ def format_delta_pct(
     return f"{sign}{pct_change:.1f}%"
 
 
-def compute_s_opt(m: Dict[str, Any], b: Dict[str, Any]) -> float:
+def compute_s_opt(m: dict[str, Any], b: dict[str, Any]) -> float:
     """Computes the composite optimization score S_opt for a run against a baseline.
 
     Args:
@@ -550,8 +551,8 @@ def compute_s_opt(m: Dict[str, Any], b: Dict[str, Any]) -> float:
 
 
 def generate_markdown_table(
-    baseline_metrics: Dict[str, Any],
-    comparison_metrics_list: List[Dict[str, Any]],
+    baseline_metrics: dict[str, Any],
+    comparison_metrics_list: list[dict[str, Any]],
     use_median: bool = True,
 ) -> str:
     """Renders a GitHub Flavored Markdown comparison table for evaluation runs.
@@ -717,8 +718,8 @@ def generate_markdown_table(
     lines.append("")
     lines.append("#### Metric Definitions & Derivation Key")
     lines.append(
-        "- **Run / Results Directory**: Identifier or directory path of the evaluation"
-        " run."
+        "- **Run / Results Directory**: Identifier or directory path of the"
+        " evaluation run."
     )
     lines.append(
         "- **Samples**: Total number of evaluation sample prompts executed in the run."
@@ -726,8 +727,8 @@ def generate_markdown_table(
     lines.append(
         "- **Score (S_opt)**: Composite Format Score `S_opt = 0.50×SchemaAcc +"
         " 0.30×QualityScore - 0.15×(CodeTok/BaseCodeTok) -"
-        " 0.05×(ReasonTok/BaseReasonTok) - 0.03×(InputTok/BaseInputTok)`. Higher score"
-        " indicates superior accuracy and token efficiency."
+        " 0.05×(ReasonTok/BaseReasonTok) - 0.03×(InputTok/BaseInputTok)`. Higher"
+        " score indicates superior accuracy and token efficiency."
     )
     lines.append(
         "- **Schema Acc (Delta)**: Percentage of outputs passing strict compiler"
@@ -739,9 +740,9 @@ def generate_markdown_table(
         " (`measured_model_graded_qa`), with point diff vs baseline."
     )
     lines.append(
-        "- **Parallel Wall Latency (Delta)**: Total wall-clock run duration divided by"
-        " sample count `(completed_at - started_at) / samples`, measuring parallel"
-        " batch throughput under concurrency."
+        "- **Parallel Wall Latency (Delta)**: Total wall-clock run duration"
+        " divided by sample count `(completed_at - started_at) / samples`,"
+        " measuring parallel batch throughput under concurrency."
     )
     lines.append(
         "- **Sample Working Time (Delta)**: Sample pure HTTP execution duration"
@@ -749,13 +750,13 @@ def generate_markdown_table(
         " times."
     )
     lines.append(
-        "- **Non-reasoning Output Time (Delta)**: Estimated time spent emitting final"
-        " code output, calculated as `Working Time × (Code Output Tokens / Total"
-        " Generated Tokens)`."
+        "- **Non-reasoning Output Time (Delta)**: Estimated time spent emitting"
+        " final code output, calculated as `Working Time × (Code Output Tokens /"
+        " Total Generated Tokens)`."
     )
     lines.append(
-        "- **Input Tok (Delta)**: Prompt input tokens sent per sample, including system"
-        " instructions and catalog schema definitions."
+        "- **Input Tok (Delta)**: Prompt input tokens sent per sample, including"
+        " system instructions and catalog schema definitions."
     )
     lines.append(
         "- **Reasoning Tok (Delta)**: Internal thinking/reasoning tokens"
@@ -768,14 +769,14 @@ def generate_markdown_table(
     lines.append("")
     stat_note = "medians" if use_median else "averages"
     lines.append(
-        f"*Notes: Latency and token metrics represent per-sample {stat_note}. Delta"
-        " percentages indicate relative gain (+) or reduction (-) against the"
-        " baseline.*"
+        f"*Notes: Latency and token metrics represent per-sample {stat_note}."
+        " Delta percentages indicate relative gain (+) or reduction (-) against"
+        " the baseline.*"
     )
     return "\n".join(lines)
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Executes the CLI entrypoint for comparing evaluation results against a baseline.
 
     Args:
@@ -794,16 +795,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         "results_dirs",
         nargs="+",
         help=(
-            "One or more target results directories or json files to compare against"
-            " baseline"
+            "One or more target results directories or json files to compare"
+            " against baseline"
         ),
     )
     parser.add_argument(
         "--average",
         action="store_true",
         help=(
-            "Compute and display sample averages instead of default medians for latency"
-            " and token metrics"
+            "Compute and display sample averages instead of default medians for"
+            " latency and token metrics"
         ),
     )
     parser.add_argument(
@@ -819,7 +820,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Load comparison runs
     comp_metrics_list = []
-    target_sample_ids: Set[str] = set()
+    target_sample_ids: set[str] = set()
 
     for r_dir in args.results_dirs:
         res_json = resolve_results_file(r_dir)

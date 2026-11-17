@@ -22,7 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # Ensure rate limiter connections limit (matches max_tasks=10)
 os.environ["INSPECT_MAX_CONNECTIONS"] = "10"
@@ -101,7 +101,7 @@ def regenerate_master_index(target_dir: str) -> None:
             notes = "-"
             status = "-"
 
-            meta_data: Dict[str, Any] = {}
+            meta_data: dict[str, Any] = {}
             meta_metrics = None
             detected_format = fmt_name if fmt_name != "default" else "-"
             if os.path.exists(meta_path):
@@ -117,6 +117,9 @@ def regenerate_master_index(target_dir: str) -> None:
                 except Exception as e:
                     print(f"Warning: Failed to parse {meta_path}: {e}", file=sys.stderr)
 
+            # Runs archived before the "model" key existed were all on
+            # gemini-3.8-flash. This fallback labels those historical runs, so it
+            # stays on 3.8 even though new runs default to gemini-3.6-flash.
             model_name = meta_data.get("model", "google/gemini-3.8-flash")
             thinking_budget = meta_data.get("thinking_budget")
             budget_str = (
@@ -178,12 +181,13 @@ def regenerate_master_index(target_dir: str) -> None:
         "# Master Optimization Run History",
         "",
         (
-            "| Format | Run ID | Model | Budget | Hypothesis | Pytest | Overall Acc |"
-            " Algo Acc | Latency | Input Tok | Output Tok | Status | Notes |"
+            "| Format | Run ID | Model | Budget | Hypothesis | Pytest | Overall"
+            " Acc | Algo Acc | Latency | Input Tok | Output Tok | Status |"
+            " Notes |"
         ),
         (
-            "| :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---:"
-            " | :---: | :---: | :--- |"
+            "| :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: |"
+            " :---: | :---: | :---: | :--- |"
         ),
     ]
     for r in all_master_runs:
@@ -201,7 +205,7 @@ def regenerate_master_index(target_dir: str) -> None:
     print(f"Regenerated master index: {master_index_file}")
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Executes the orchestrator CLI for running and analyzing format optimizations.
 
     Args:
@@ -220,7 +224,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemini-3.8-flash",
+        default="google/gemini-3.6-flash",
         help="Evaluation model name",
     )
     parser.add_argument(
@@ -519,7 +523,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "schema_acc": metrics_ext.get("algo_accuracy", 0.0),
                 "quality_acc": metrics_ext.get("overall_accuracy", 0.0),
                 "code_tokens_median": metrics_ext.get(
-                    "median_output_tokens", metrics_ext.get("avg_output_tokens", 0.0)
+                    "median_output_tokens",
+                    metrics_ext.get("avg_output_tokens", 0.0),
                 ),
                 "reasoning_tokens_median": metrics_ext.get(
                     "median_reasoning_tokens",
@@ -582,14 +587,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             "schema_acc": metrics_extracted.get("algo_accuracy", 0.0),
             "quality_acc": metrics_extracted.get("overall_accuracy", 0.0),
             "code_tokens_median": metrics_extracted.get(
-                "median_output_tokens", metrics_extracted.get("avg_output_tokens", 0.0)
+                "median_output_tokens",
+                metrics_extracted.get("avg_output_tokens", 0.0),
             ),
             "reasoning_tokens_median": metrics_extracted.get(
                 "median_reasoning_tokens",
                 metrics_extracted.get("avg_reasoning_tokens", 0.0),
             ),
             "input_tokens_median": metrics_extracted.get(
-                "median_input_tokens", metrics_extracted.get("avg_input_tokens", 0.0)
+                "median_input_tokens",
+                metrics_extracted.get("avg_input_tokens", 0.0),
             ),
             "latency_seconds_median": metrics_extracted.get(
                 "median_latency_seconds",

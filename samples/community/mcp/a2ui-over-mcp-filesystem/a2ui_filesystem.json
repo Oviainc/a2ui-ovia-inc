@@ -1,0 +1,578 @@
+[
+  {
+    "version": "1.0",
+    "createSurface": {
+      "surfaceId": "fs-browser",
+      "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+    }
+  },
+  {
+    "version": "1.0",
+    "updateDataModel": {
+      "surfaceId": "fs-browser",
+      "value": {
+        "entries": [],
+        "entries_title": "Loading your home directory",
+        "viewer_title": "No file open",
+        "currentFile": {
+          "text": "Choose a file on the left to read it."
+        },
+        "expr": {
+          "list": "{dir: dir, rows: rows[?@ != null]} | {\n  \"/dir\": dir,\n  \"/row_base\": join('', [dir, '/']),\n  \"/entries\": rows[*].{\n    name: [1],\n    size: [2] || '',\n    icon: ([0] == 'DIR' && 'folder') || 'attachFile',\n    tool: ([0] == 'DIR' && 'list_directory_with_sizes') || 'read_text_file',\n    target: ([0] == 'DIR' && '/listing') || '/currentFile',\n    kind: ([0] == 'DIR' && 'dir') || 'file',\n    pattern: ([0] == 'DIR' && '^\\[(DIR|FILE)\\] ([^.\\s](?: ?\\S)*)(?:  +(?:([0-9.]+ [A-Za-z]+) *)?)?$') || '^(.*)$'\n  },\n  \"/entries_title\": join('', [\n    to_string(length(rows)),\n    (length(rows) == `1` && ' entry') || ' entries'\n  ]),\n  \"/viewer_title\": (dir == '~' && 'Home Directory (~)') || dir,\n  \"/currentFile\": {text: 'Choose a file on the left to read it.'}\n}",
+          "read": "{\"/viewer_title\": dir}",
+          "search": "{\n  dir: dir,\n  pattern: pattern,\n  hits: rows[*][0] | [?@ != '' && !contains(@, 'No matches')]\n} | {\n  \"/dir\": dir,\n  \"/row_base\": '',\n  \"/entries\": hits[*].{\n    name: @,\n    size: '',\n    icon: 'attachFile',\n    tool: 'read_text_file',\n    target: '/currentFile',\n    kind: 'file',\n    pattern: '^(.*)$'\n  },\n  \"/entries_title\": join('', [\n    'Search: ',\n    to_string(length(hits)),\n    (length(hits) == `1` && ' match') || ' matches',\n    ' in `', dir, '`'\n  ]),\n  \"/viewer_title\": join('', ['Search in ', dir]),\n  \"/currentFile\": {text: (length(hits) > `0` && join('', [\n    'Found ',\n    to_string(length(hits)),\n    (length(hits) == `1` && ' match') || ' matches',\n    ' for glob `', pattern, '` in `', dir, '`. Select a file on the left to read it.'\n  ])) || join('', ['No matches found for glob `', pattern, '` in `', dir, '`.'])}\n}"
+        },
+        "dir": "~",
+        "row_base": "~/",
+        "search_pattern": "**/*.md"
+      }
+    }
+  },
+  {
+    "version": "1.0",
+    "updateComponents": {
+      "surfaceId": "fs-browser",
+      "components": [
+        {
+          "id": "root",
+          "component": "Column",
+          "children": ["title", "subtitle", "body"]
+        },
+        {
+          "id": "title",
+          "component": "Text",
+          "text": "## Local files over MCP"
+        },
+        {
+          "id": "subtitle",
+          "component": "Text",
+          "text": "Every control on this page is a callMcpTool call against the reference filesystem MCP server. The payload carries the JMESPath that turns each response into data model updates.",
+          "variant": "caption"
+        },
+        {
+          "id": "body",
+          "component": "Row",
+          "children": ["left_pane", "right_pane"]
+        },
+        {
+          "id": "left_pane",
+          "component": "Column",
+          "weight": 1,
+          "children": ["top_card", "entries_card"]
+        },
+        {
+          "id": "top_card",
+          "component": "Card",
+          "child": "controls_row"
+        },
+        {
+          "id": "controls_row",
+          "component": "Row",
+          "children": ["nav_column", "search_column"]
+        },
+        {
+          "id": "nav_column",
+          "component": "Column",
+          "weight": 1,
+          "children": ["path_field", "nav_row"]
+        },
+        {
+          "id": "path_field",
+          "component": "TextField",
+          "label": "Directory",
+          "value": {
+            "@path": "/dir"
+          }
+        },
+        {
+          "id": "nav_row",
+          "component": "Row",
+          "children": ["open_button", "parent_button", "home_button"]
+        },
+        {
+          "id": "open_button",
+          "component": "Button",
+          "variant": "primary",
+          "child": "open_button_text",
+          "action": {
+            "functionCall": {
+              "@call": "updateDataModel",
+              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+              "args": {
+                "updates": {
+                  "@call": "transformData",
+                  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                  "args": {
+                    "jmespath": {
+                      "@path": "/expr/list"
+                    },
+                    "data": {
+                      "dir": {
+                        "@path": "/dir"
+                      },
+                      "rows": {
+                        "@call": "regexCapture",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "value": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@call": "transformData",
+                                "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                "args": {
+                                  "jmespath": "text",
+                                  "data": {
+                                    "@call": "callMcpTool",
+                                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                    "args": {
+                                      "name": "list_directory_with_sizes",
+                                      "arguments": {
+                                        "path": {
+                                          "@path": "/dir"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "separator": "\n"
+                            }
+                          },
+                          "pattern": "^\\[(DIR|FILE)\\] ([^.\\s](?: ?\\S)*)(?:  +(?:([0-9.]+ [A-Za-z]+) *)?)?$"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "open_button_text",
+          "component": "Text",
+          "text": "List directory"
+        },
+        {
+          "id": "parent_button",
+          "component": "Button",
+          "child": "parent_button_text",
+          "action": {
+            "functionCall": {
+              "@call": "updateDataModel",
+              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+              "args": {
+                "updates": {
+                  "@call": "transformData",
+                  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                  "args": {
+                    "jmespath": {
+                      "@path": "/expr/list"
+                    },
+                    "data": {
+                      "dir": {
+                        "@call": "transformData",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "jmespath": "(length(@) > `1` && (join('/', [:-1]) || '/')) || [0]",
+                          "data": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@path": "/dir"
+                              },
+                              "separator": "/"
+                            }
+                          }
+                        }
+                      },
+                      "rows": {
+                        "@call": "regexCapture",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "value": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@call": "transformData",
+                                "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                "args": {
+                                  "jmespath": "text",
+                                  "data": {
+                                    "@call": "callMcpTool",
+                                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                    "args": {
+                                      "name": "list_directory_with_sizes",
+                                      "arguments": {
+                                        "path": {
+                                          "@call": "transformData",
+                                          "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                          "args": {
+                                            "jmespath": "(length(@) > `1` && (join('/', [:-1]) || '/')) || [0]",
+                                            "data": {
+                                              "@call": "split",
+                                              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                              "args": {
+                                                "value": {
+                                                  "@path": "/dir"
+                                                },
+                                                "separator": "/"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "separator": "\n"
+                            }
+                          },
+                          "pattern": "^\\[(DIR|FILE)\\] ([^.\\s](?: ?\\S)*)(?:  +(?:([0-9.]+ [A-Za-z]+) *)?)?$"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "parent_button_text",
+          "component": "Text",
+          "text": "Parent"
+        },
+        {
+          "id": "home_button",
+          "component": "Button",
+          "child": "home_button_text",
+          "action": {
+            "functionCall": {
+              "@call": "updateDataModel",
+              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+              "args": {
+                "updates": {
+                  "@call": "transformData",
+                  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                  "args": {
+                    "jmespath": {
+                      "@path": "/expr/list"
+                    },
+                    "data": {
+                      "dir": "~",
+                      "rows": {
+                        "@call": "regexCapture",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "value": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@call": "transformData",
+                                "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                "args": {
+                                  "jmespath": "text",
+                                  "data": {
+                                    "@call": "callMcpTool",
+                                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                    "args": {
+                                      "name": "list_directory_with_sizes",
+                                      "arguments": {
+                                        "path": "~"
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "separator": "\n"
+                            }
+                          },
+                          "pattern": "^\\[(DIR|FILE)\\] ([^.\\s](?: ?\\S)*)(?:  +(?:([0-9.]+ [A-Za-z]+) *)?)?$"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "home_button_text",
+          "component": "Text",
+          "text": "Home"
+        },
+        {
+          "id": "search_column",
+          "component": "Column",
+          "weight": 1,
+          "children": ["search_field", "search_button"]
+        },
+        {
+          "id": "search_field",
+          "component": "TextField",
+          "label": "Search in directory (glob)",
+          "value": {
+            "@path": "/search_pattern"
+          }
+        },
+        {
+          "id": "search_button",
+          "component": "Button",
+          "child": "search_button_text",
+          "action": {
+            "functionCall": {
+              "@call": "updateDataModel",
+              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+              "args": {
+                "updates": {
+                  "@call": "transformData",
+                  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                  "args": {
+                    "jmespath": {
+                      "@path": "/expr/search"
+                    },
+                    "data": {
+                      "dir": {
+                        "@path": "/dir"
+                      },
+                      "pattern": {
+                        "@path": "/search_pattern"
+                      },
+                      "rows": {
+                        "@call": "regexCapture",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "value": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@call": "transformData",
+                                "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                "args": {
+                                  "jmespath": "text",
+                                  "data": {
+                                    "@call": "callMcpTool",
+                                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                    "args": {
+                                      "name": "search_files",
+                                      "arguments": {
+                                        "path": {
+                                          "@path": "/dir"
+                                        },
+                                        "pattern": {
+                                          "@path": "/search_pattern"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "separator": "\n"
+                            }
+                          },
+                          "pattern": "^(.*)$"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "search_button_text",
+          "component": "Text",
+          "text": "Search in directory"
+        },
+        {
+          "id": "entries_card",
+          "component": "Card",
+          "child": "entries_column"
+        },
+        {
+          "id": "entries_column",
+          "component": "Column",
+          "children": ["entries_title", "entries_list"]
+        },
+        {
+          "id": "entries_title",
+          "component": "Text",
+          "text": {
+            "@call": "formatString",
+            "args": {
+              "value": "##### ${/entries_title}"
+            }
+          }
+        },
+        {
+          "id": "entries_list",
+          "component": "List",
+          "children": {
+            "componentId": "entry_row",
+            "path": "/entries"
+          }
+        },
+        {
+          "id": "entry_row",
+          "component": "Row",
+          "children": ["entry_icon", "entry_button", "entry_size"]
+        },
+        {
+          "id": "entry_icon",
+          "component": "Icon",
+          "name": {
+            "@path": "icon"
+          }
+        },
+        {
+          "id": "entry_button",
+          "component": "Button",
+          "variant": "borderless",
+          "weight": 1,
+          "child": "entry_name",
+          "action": {
+            "functionCall": {
+              "@call": "updateDataModel",
+              "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+              "args": {
+                "updates": {
+                  "@call": "transformData",
+                  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                  "args": {
+                    "jmespath": {
+                      "@call": "transformData",
+                      "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                      "args": {
+                        "jmespath": "(kind == 'dir' && list) || read",
+                        "data": {
+                          "kind": {
+                            "@path": "kind"
+                          },
+                          "list": {
+                            "@path": "/expr/list"
+                          },
+                          "read": {
+                            "@path": "/expr/read"
+                          }
+                        }
+                      }
+                    },
+                    "data": {
+                      "dir": {
+                        "@call": "formatString",
+                        "args": {
+                          "value": "${/row_base}${name}"
+                        }
+                      },
+                      "rows": {
+                        "@call": "regexCapture",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                        "args": {
+                          "value": {
+                            "@call": "split",
+                            "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                            "args": {
+                              "value": {
+                                "@call": "transformData",
+                                "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                "args": {
+                                  "jmespath": "text",
+                                  "data": {
+                                    "@call": "callMcpTool",
+                                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/mcp/catalog.json",
+                                    "args": {
+                                      "name": {
+                                        "@path": "tool"
+                                      },
+                                      "arguments": {
+                                        "path": {
+                                          "@call": "formatString",
+                                          "args": {
+                                            "value": "${/row_base}${name}"
+                                          }
+                                        }
+                                      },
+                                      "targetDataPath": {
+                                        "@path": "target"
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "separator": "\n"
+                            }
+                          },
+                          "pattern": {
+                            "@path": "pattern"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "entry_name",
+          "component": "Text",
+          "text": {
+            "@path": "name"
+          }
+        },
+        {
+          "id": "entry_size",
+          "component": "Text",
+          "text": {
+            "@path": "size"
+          },
+          "variant": "caption"
+        },
+        {
+          "id": "right_pane",
+          "component": "Column",
+          "weight": 1,
+          "children": ["viewer_card"]
+        },
+        {
+          "id": "viewer_card",
+          "component": "Card",
+          "child": "viewer_column"
+        },
+        {
+          "id": "viewer_column",
+          "component": "Column",
+          "children": ["viewer_title", "viewer_body"]
+        },
+        {
+          "id": "viewer_title",
+          "component": "Text",
+          "text": {
+            "@call": "formatString",
+            "args": {
+              "value": "##### ${/viewer_title}"
+            }
+          }
+        },
+        {
+          "id": "viewer_body",
+          "component": "Text",
+          "text": {
+            "@path": "/currentFile/text"
+          }
+        }
+      ]
+    }
+  }
+]

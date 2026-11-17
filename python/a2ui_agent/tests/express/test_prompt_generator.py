@@ -1,0 +1,379 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests focusing on the A2UI Express Prompt Generator."""
+
+import json
+import os
+import tempfile
+import unittest
+
+from a2ui.core import Catalog
+from a2ui.core.schema import ProtocolVersion
+from a2ui.inference_formats.express import ExpressFormat
+
+
+class TestExpressPromptGenerator(unittest.TestCase):
+    """Test suite covering Express prompt generation, examples pruning, and validation."""
+
+    def setUp(self):
+        self.catalog = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="https://a2ui.org/test_catalog",
+            catalog_schema={
+                "catalogId": "https://a2ui.org/test_catalog",
+                "components": {
+                    "Text": {
+                        "properties": {"text": {"type": "string", "positionalIndex": 0}}
+                    }
+                },
+                "functions": {
+                    "openUrl": {
+                        "properties": {"url": {"type": "string", "positionalIndex": 0}}
+                    }
+                },
+            },
+        )
+        self.tmp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_express_prompt_generator_property(self):
+        express_format = ExpressFormat([self.catalog])
+        generator = express_format.prompt_generator
+
+        prompt = generator.generate()
+        self.assertIn("# A2UI Express DSL Output Contract", prompt)
+        self.assertIn("Text(", prompt)
+
+    def test_catalog_description_before_generate(self):
+        express_format = ExpressFormat([self.catalog])
+        generator = express_format.prompt_generator
+        desc = generator.generate_catalog_instructions(include_schema=True)
+        self.assertIn("Text(", desc)
+
+    def test_express_allowed_components_pruning(self):
+        from a2ui.catalog_transformers import ComponentPruningTransformer
+
+        pruned_catalog = ComponentPruningTransformer(["Button"]).transform(self.catalog)
+        express_format = ExpressFormat([pruned_catalog])
+        generator = express_format.prompt_generator
+
+        # Only allow other component tags, Text should be pruned out
+        prompt = generator.generate()
+        self.assertNotIn("Text(", prompt)
+
+    def test_express_include_examples_transformation(self):
+        from a2ui.inference_formats import to_message_models
+
+        example_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "welcome",
+                "catalogId": self.catalog.catalog_id,
+                "components": [
+                    {"id": "root", "component": "Text", "text": "Hello World"}
+                ],
+            },
+        }
+        md_content = (
+            f"Some markdown text.\n\n```json\n{json.dumps(example_payload)}\n```\n"
+        )
+        md_file_path = os.path.join(self.tmp_dir.name, "examples.md")
+        with open(md_file_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        express_format = ExpressFormat(
+            [self.catalog], examples=[to_message_models([example_payload])]
+        )
+        generator = express_format.prompt_generator
+
+        prompt = generator.generate()
+
+        # Verify examples are included and decompiled
+        self.assertIn("### Examples:", prompt)
+        self.assertIn('root = Text("Hello World")', prompt)
+
+        # Also verify transform_examples on markdown content
+        transformed = generator.transform_examples(md_content)
+        self.assertIn('root = Text("Hello World")', transformed)
+
+    def test_express_examples_validation(self):
+        from a2ui.inference_formats import to_message_models
+        from a2ui.utils import load_examples
+
+        # Write a valid standard A2UI JSON example file
+        example_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "welcome",
+                "catalogId": self.catalog.catalog_id,
+                "components": [
+                    {"id": "root", "component": "Text", "text": "Hello World"}
+                ],
+            },
+        }
+        json_file_path = os.path.join(self.tmp_dir.name, "example_1.json")
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(example_payload, f)
+
+        loaded_md = load_examples([self.catalog], self.tmp_dir.name, validate=True)
+        express_format = ExpressFormat(
+            [self.catalog], examples=[to_message_models([example_payload])]
+        )
+        generator = express_format.prompt_generator
+
+        prompt = generator.generate()
+
+        self.assertIn("### Examples:", prompt)
+        self.assertIn("---BEGIN example_1---", generator.transform_examples(loaded_md))
+
+    def test_express_transform_examples_edge_cases(self):
+        """Test transform_examples with JSON array blocks, non-A2UI JSON, and invalid JSON."""
+        express_format = ExpressFormat([self.catalog])
+        generator = express_format.prompt_generator
+
+        # 1. JSON array block
+        array_md = (
+            '```json\n[{"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}]\n```'
+        )
+        trans_array = generator.transform_examples(array_md)
+        self.assertIn('deleteSurface("s1")', trans_array)
+
+        # 2. Non-A2UI JSON block
+        non_a2ui_md = '```json\n{"foo": "bar"}\n```'
+        self.assertEqual(generator.transform_examples(non_a2ui_md), non_a2ui_md)
+
+        # 3. Invalid JSON block
+        invalid_md = "```json\n{invalid}\n```"
+        self.assertEqual(generator.transform_examples(invalid_md), invalid_md)
+
+    def test_express_signatures_with_object_properties(self):
+        """Test component signatures generation for object properties with map keys."""
+        cat_map_obj = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="https://a2ui.org/map_catalog",
+            catalog_schema={
+                "catalogId": "https://a2ui.org/map_catalog",
+                "components": {
+                    "MapComp": {
+                        "properties": {
+                            "config": {
+                                "type": "object",
+                                "properties": {
+                                    "key1": {
+                                        "type": "string",
+                                        "description": "Key 1 desc",
+                                    },
+                                },
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        fmt = ExpressFormat([cat_map_obj])
+        sigs = fmt.prompt_generator._generate_component_signatures()
+        self.assertIn("MapComp", sigs)
+        self.assertIn("Map with keys:", sigs)
+
+    def test_express_schema_helper_methods(self):
+        from a2ui.inference_formats._shared import (
+            CatalogSchemaHelper as ExpressCatalogSchemaHelper,
+        )
+
+        cat = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="test",
+            catalog_schema={
+                "catalogId": "test",
+                "components": {
+                    "Button": {
+                        "description": "Button component",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "action": {"$ref": "common_types.json#/$defs/Action"},
+                            "children": {"$ref": "common_types.json#/$defs/ChildList"},
+                            "child": {"$ref": "common_types.json#/$defs/Child"},
+                        },
+                    },
+                    "Card": {
+                        "properties": {
+                            "content": {
+                                "oneOf": [
+                                    {"$ref": "common_types.json#/$defs/ChildList"}
+                                ]
+                            }
+                        }
+                    },
+                },
+                "functions": {
+                    "openUrl": {
+                        "description": "Opens URL",
+                        "properties": {
+                            "args": {"properties": {"url": {"type": "string"}}}
+                        },
+                    }
+                },
+            },
+        )
+        helper = ExpressCatalogSchemaHelper(cat)
+        self.assertEqual(helper.get_component_description("Button"), "Button component")
+        self.assertEqual(helper.get_function_description("openUrl"), "Opens URL")
+        self.assertEqual(helper.get_property_type("Button", "action"), "Action")
+        self.assertEqual(helper.get_property_type("Button", "children"), "ChildList")
+        self.assertEqual(helper.get_property_type("Button", "child"), "Child")
+        self.assertEqual(helper.get_property_type("Card", "content"), "ChildList")
+        self.assertEqual(
+            helper.get_function_property_schema("openUrl", "url"),
+            {"type": "string"},
+        )
+
+    def test_express_standalone_call_rule_lists_only_agent_callable_functions(self):
+        cat = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="conformance/allowed_callers",
+            catalog_schema={
+                "catalogId": "conformance/allowed_callers",
+                "protocolVersion": "1.0",
+                "components": {
+                    "Text": {
+                        "properties": {
+                            "component": {"const": "Text"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["component", "text"],
+                    }
+                },
+                "functions": {
+                    "notifyAgent": {
+                        "returnType": "void",
+                        "allowedCallers": "agentOnly",
+                        "properties": {
+                            "@call": {"const": "notifyAgent"},
+                            "args": {"type": "object", "properties": {}},
+                        },
+                    },
+                    "showToast": {
+                        "returnType": "void",
+                        "allowedCallers": "rendererOrAgent",
+                        "properties": {
+                            "@call": {"const": "showToast"},
+                            "args": {"type": "object", "properties": {}},
+                        },
+                    },
+                    "formatValue": {
+                        "returnType": "string",
+                        "properties": {
+                            "@call": {"const": "formatValue"},
+                            "args": {"type": "object", "properties": {}},
+                        },
+                    },
+                    "launch": {
+                        "returnType": "void",
+                        "allowedCallers": "rendererOnly",
+                        "requiresUserActivation": True,
+                        "properties": {
+                            "@call": {"const": "launch"},
+                            "args": {"type": "object", "properties": {}},
+                        },
+                    },
+                },
+            },
+        )
+        generator = ExpressFormat([cat]).prompt_generator
+        rules = generator.generate_base_rules()
+        self.assertIn(
+            "Only these functions can be called this way: `notifyAgent`, `showToast`.",
+            rules,
+        )
+        self.assertNotIn("`formatValue`", rules)
+        self.assertNotIn("`launch`", rules)
+        filtered = generator.generate_base_rules(
+            allowed_messages=["createSurface", "updateComponents"]
+        )
+        self.assertNotIn("Only these functions can be called this way", filtered)
+
+    def test_express_multi_catalog_rules_renumber_sequentially_with_callable_functions(
+        self,
+    ):
+        import re
+
+        cat_a = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="test/cat_a",
+            catalog_schema={
+                "catalogId": "test/cat_a",
+                "protocolVersion": "1.0",
+                "components": {
+                    "Text": {
+                        "properties": {
+                            "component": {"const": "Text"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["component", "text"],
+                    }
+                },
+                "functions": {
+                    "showToast": {
+                        "returnType": "void",
+                        "allowedCallers": "rendererOrAgent",
+                        "properties": {
+                            "@call": {"const": "showToast"},
+                            "args": {"type": "object", "properties": {}},
+                        },
+                    }
+                },
+            },
+        )
+        cat_b = Catalog.from_json(
+            protocol_version=ProtocolVersion.V1_0,
+            catalog_id="test/cat_b",
+            catalog_schema={
+                "catalogId": "test/cat_b",
+                "protocolVersion": "1.0",
+                "components": {
+                    "Badge": {
+                        "properties": {
+                            "component": {"const": "Badge"},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["component", "label"],
+                    }
+                },
+                "functions": {},
+            },
+        )
+        generator = ExpressFormat([cat_a, cat_b]).prompt_generator
+        rules = generator.generate_base_rules()
+        numbers = [int(m) for m in re.findall(r"(?m)^(\d+)\. ", rules)]
+        self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
+        self.assertIn("## Multiple Catalogs", rules)
+        self.assertIn(
+            "Only these functions can be called this way: `showToast`.", rules
+        )
+
+        filtered = generator.generate_base_rules(
+            allowed_messages=["createSurface", "updateComponents"]
+        )
+        filtered_numbers = [int(m) for m in re.findall(r"(?m)^(\d+)\. ", filtered)]
+        self.assertEqual(filtered_numbers, list(range(1, len(filtered_numbers) + 1)))
+        self.assertIn("## Multiple Catalogs", filtered)
+        self.assertNotIn("Only these functions can be called this way", filtered)
+        self.assertNotIn("deleteSurface(", filtered)
+
+
+if __name__ == "__main__":
+    unittest.main()

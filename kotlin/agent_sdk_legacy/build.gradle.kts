@@ -78,6 +78,16 @@ val copySpecs by tasks.registering(Copy::class) {
     into("com/google/a2ui/assets/0.9/catalogs/basic")
   }
 
+  from(File(repoRoot, "specification/v0_9_1/json/server_to_client.json")) {
+    into("com/google/a2ui/assets/0.9.1")
+  }
+  from(File(repoRoot, "specification/v0_9_1/json/common_types.json")) {
+    into("com/google/a2ui/assets/0.9.1")
+  }
+  from(File(repoRoot, "specification/v0_9_1/catalogs/basic/catalog.json")) {
+    into("com/google/a2ui/assets/0.9.1/catalogs/basic")
+  }
+
   into(layout.buildDirectory.dir("generated/resources/specs"))
 }
 
@@ -116,6 +126,10 @@ tasks.withType<JavaCompile>().configureEach {
 tasks.generateGrammarSource {
   arguments = arguments + listOf("-visitor", "-package", "com.google.a2ui.inference_formats.experimental.express.generated")
   outputDirectory = file("${layout.buildDirectory.get()}/generated/sources/antlr/main/com/google/a2ui/inference_formats/experimental/express/generated")
+}
+
+tasks.matching { it.name.startsWith("ktfmt") }.configureEach {
+  mustRunAfter(tasks.withType<AntlrTask>())
 }
 
 

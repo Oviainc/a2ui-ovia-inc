@@ -16,8 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
-from a2ui.schema.constants import VERSION_0_8, VERSION_0_9
+from a2ui.core.schema import ProtocolVersion
 
 import jsonschema
 
@@ -28,7 +27,7 @@ LOCATION_SURFACE_ID = "location-surface"
 
 
 def load_floor_plan_example(
-    version: Optional[str] = None, html_content: str = ""
+    version: str | None = None, html_content: str = ""
 ) -> list[dict]:
     """Constructs the JSON for the location surface displaying the floor plan."""
     if not version:
@@ -40,7 +39,7 @@ def load_floor_plan_example(
         if os.environ.get("USE_MCP_SANDBOX", "true").lower() == "true"
         else "(iFrame)"
     )
-    if version == VERSION_0_8:
+    if version == ProtocolVersion.V0_8:
         return [
             {
                 "beginRendering": {
@@ -126,7 +125,7 @@ def load_floor_plan_example(
             },
         ]
 
-    if version == VERSION_0_9:
+    if version == ProtocolVersion.V0_9:
         return [
             {
                 "version": "v0.9",
@@ -151,11 +150,11 @@ def load_floor_plan_example(
         ]
 
 
-def load_close_modal_example(version: Optional[str] = None) -> list[dict]:
+def load_close_modal_example(version: str | None = None) -> list[dict]:
     """Constructs the JSON for closing the floor plan modal."""
-    if version == VERSION_0_8:
+    if version == ProtocolVersion.V0_8:
         return [{"deleteSurface": {"surfaceId": LOCATION_SURFACE_ID}}]
-    if version == VERSION_0_9:
+    if version == ProtocolVersion.V0_9:
         return [{
             "version": "v0.9",
             "deleteSurface": {
@@ -164,7 +163,7 @@ def load_close_modal_example(version: Optional[str] = None) -> list[dict]:
         }]
 
 
-def load_send_message_example(contact_name: str, version: Optional[str] = None) -> str:
+def load_send_message_example(contact_name: str, version: str | None = None) -> str:
     """Constructs the JSON string for the send message confirmation."""
     from pathlib import Path
 
@@ -178,7 +177,7 @@ def load_send_message_example(contact_name: str, version: Optional[str] = None) 
                 "Your action has been processed.", f"Message sent to {contact_name}!"
             )
         return json_content
-    if version == VERSION_0_8:
+    if version == ProtocolVersion.V0_8:
         return (
             '[{ "beginRendering": { "surfaceId": "action-modal", "root":'
             ' "modal-wrapper" } }, { "surfaceUpdate": { "surfaceId": "action-modal",'
@@ -189,7 +188,7 @@ def load_send_message_example(contact_name: str, version: Optional[str] = None) 
             ' {"literalString": "Message Sent (Fallback)"} } } } ] } }]'
         )
 
-    if version == VERSION_0_9:
+    if version == ProtocolVersion.V0_9:
         return (
             '[{ "version": "v0.9", "createSurface": { "surfaceId": "action-modal",'
             ' "catalogId": "inline_catalog" } }, { "version": "v0.9",'

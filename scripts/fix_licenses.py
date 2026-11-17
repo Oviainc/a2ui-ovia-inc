@@ -17,8 +17,10 @@
 
 This script ensures that all source files in the repository contain proper
 Apache 2.0 license headers, copyright year 2024 for Google LLC, and HTTPS
-links for Apache license URLs. It handles edge cases such as generated files,
-empty files, shebang preservation, line ending normalization, and custom ignore patterns.
+links for Apache license URLs. It also ensures that all LICENSE files use HTTP
+links for Apache license URLs (required for SPDX and package registry tooling like
+pub.dev's pana). It handles edge cases such as generated files, empty files,
+shebang preservation, line ending normalization, and custom ignore patterns.
 """
 
 import argparse
@@ -28,7 +30,6 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import List, Optional
 
 # Configuration: Relative glob patterns for files and directories ignored
 # during license header scanning and processing.
@@ -43,6 +44,11 @@ IGNORE_PATTERNS = [
     "**/.venv/**",
     "**/node_modules/**",
     "**/build/**",
+    "**/dist/**",
+    "**/.wireit/**",
+    "**/.next/**",
+    "**/.playwright/**",
+    "**/next-env.d.ts",
     "**/.dart_tool/**",
     "**/generated/**",
     "**/third_party/**",
@@ -51,17 +57,21 @@ IGNORE_PATTERNS = [
 ]
 
 
-def should_ignore(rel_path: str) -> bool:
+def should_ignore(rel_path: str, patterns: list[str] | None = None) -> bool:
     """Determines if a given relative file path should be ignored.
 
     Args:
         rel_path: Relative path of the file from repository root.
+        patterns: Optional list of glob patterns to match against. Defaults to
+          IGNORE_PATTERNS.
 
     Returns:
-        True if the file matches any pattern in IGNORE_PATTERNS, False otherwise.
+        True if the file matches any pattern, False otherwise.
     """
+    if patterns is None:
+        patterns = IGNORE_PATTERNS
     normalized_path = rel_path.replace(os.sep, "/")
-    for pattern in IGNORE_PATTERNS:
+    for pattern in patterns:
         clean_pat = pattern.lstrip("/")
         if fnmatch.fnmatch(normalized_path, clean_pat):
             return True
@@ -81,7 +91,7 @@ def should_ignore(rel_path: str) -> bool:
 
 
 def is_generated_file(content: str) -> bool:
-    """Checks if a file contains a generated code header in its first 10 lines.
+    """Checks if a file contains a generated code header in its first 20 lines.
 
     Args:
         content: The text content of the file.
@@ -89,7 +99,7 @@ def is_generated_file(content: str) -> bool:
     Returns:
         True if the file contains markers indicating it was generated, False otherwise.
     """
-    lines = content.splitlines()[:10]
+    lines = content.splitlines()[:20]
     pattern = re.compile(r"generated.*(file|code)|auto-generated", re.IGNORECASE)
     return any(pattern.search(line) for line in lines)
 
@@ -135,7 +145,7 @@ def strip_incorrect_headers(content: str) -> str:
     return content
 
 
-def find_addlicense() -> Optional[str]:
+def find_addlicense() -> str | None:
     """Locates the addlicense executable binary.
 
     Checks PATH first, then falls back to the user's Go bin directory
@@ -222,7 +232,7 @@ def run_addlicense(addlicense_bin: str, check_mode: bool, repo_root: str) -> boo
     return res.returncode == 0
 
 
-def get_tracked_files(repo_root: str) -> List[str]:
+def get_tracked_files(repo_root: str) -> list[str]:
     """Retrieves all git-tracked files in the repository.
 
     Args:
@@ -241,7 +251,7 @@ def get_tracked_files(repo_root: str) -> List[str]:
     return [os.path.join(repo_root, f) for f in res.stdout.splitlines()]
 
 
-def process_files(repo_root: str, check_mode: bool) -> List[str]:
+def process_files(repo_root: str, check_mode: bool) -> list[str]:
     """Scans and fixes or checks copyright years and Apache URL schemes.
 
     addlicense only adds missing headers to un-headared files; it skips
@@ -352,27 +362,39 @@ def process_files(repo_root: str, check_mode: bool) -> List[str]:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(new_content)
 
-    # Handle root LICENSE file separately
-    license_path = os.path.join(repo_root, "LICENSE")
-    if os.path.exists(license_path):
-        with open(license_path, "r", encoding="utf-8") as f:
-            lic_content = f.read()
-        if check_mode:
-            if ("http:" + "//www.apache.org/licenses") in lic_content:
-                errors.append("HTTP Apache URL found in root LICENSE")
-        else:
-            new_lic = lic_content.replace(
-                "http:" + "//www.apache.org/licenses",
-                "https://www.apache.org/licenses",
-            )
-            if new_lic != lic_content:
-                with open(license_path, "w", encoding="utf-8") as f:
-                    f.write(new_lic)
+    # Handle all LICENSE files separately (SPDX/pana standard requires http:// in LICENSE files)
+    active_patterns = [p for p in IGNORE_PATTERNS if p != "LICENSE"]
+    license_files = {
+        f
+        for f in files
+        if os.path.basename(f) == "LICENSE"
+        and not should_ignore(os.path.relpath(f, repo_root), patterns=active_patterns)
+    }
+    root_license = os.path.join(repo_root, "LICENSE")
+    if os.path.exists(root_license):
+        license_files.add(root_license)
+
+    for filepath in sorted(license_files):
+        rel_path = os.path.relpath(filepath, repo_root)
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                lic_content = f.read()
+            if check_mode:
+                if ("https:" + "//www.apache.org/licenses") in lic_content:
+                    errors.append(f"HTTPS Apache URL found in: {rel_path}")
+            else:
+                new_lic = lic_content.replace(
+                    "https:" + "//www.apache.org/licenses",
+                    "http:" + "//www.apache.org/licenses",
+                )
+                if new_lic != lic_content:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        f.write(new_lic)
 
     return errors
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Main CLI entrypoint for license checking and fixing.
 
     Args:
@@ -396,7 +418,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         addlicense_ok = run_addlicense(
             addlicense_bin, check_mode=True, repo_root=repo_root
         )
-        print("Checking copyright years and HTTPS URLs...")
+        print("Checking copyright years and license URLs...")
         errors = process_files(repo_root, check_mode=True)
 
         if not addlicense_ok or errors:
@@ -410,7 +432,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         process_files(repo_root, check_mode=False)
         print("Adding missing Apache 2.0 license headers...")
         run_addlicense(addlicense_bin, check_mode=False, repo_root=repo_root)
-        print("Updating copyright notices and HTTPS links...")
+        print("Updating copyright notices and license links...")
         process_files(repo_root, check_mode=False)
         print("License and copyright fixes applied successfully.")
 

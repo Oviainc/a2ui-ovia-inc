@@ -1,0 +1,156 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for state-machine-based BlockLexer."""
+
+import unittest
+
+from a2ui.parser import BlockLexer
+
+
+class TestBlockLexer(unittest.TestCase):
+    """Unit test suite for BlockLexer."""
+
+    def test_lexer_standard_parsing(self):
+        """Verify standard unwrapping of tags and conversational text."""
+        content = "Preamble\n<a2ui>\ncode_here\n</a2ui>\nPostamble"
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertTrue(parts[0].is_final)
+        self.assertEqual(parts[1].part.a2ui_raw, "code_here")
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+        self.assertTrue(parts[2].is_final)
+
+    def test_lexer_embedded_tag_in_string(self):
+        """Verify embedded close tag inside double-quoted string doesn't split the block."""
+        content = 'Preamble\n<a2ui>\ntext = "Hello </a2ui> World"\n</a2ui>'
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, 'text = "Hello </a2ui> World"')
+        self.assertTrue(parts[1].is_final)
+
+    def test_lexer_triple_quoted_string(self):
+        """Verify embedded close tag inside triple quotes doesn't split the block."""
+        content = 'Preamble\n<a2ui>\ntext = """\nLine 1\n</a2ui>\nLine 2\n"""\n</a2ui>'
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(
+            parts[1].part.a2ui_raw, 'text = """\nLine 1\n</a2ui>\nLine 2\n"""'
+        )
+        self.assertTrue(parts[1].is_final)
+
+    def test_lexer_unclosed_block_truncation(self):
+        """Verify lexer auto-closes truncated block and sets is_final=False."""
+        content = 'Preamble\n<a2ui>\ntext = "Hello'
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, 'text = "Hello')
+        self.assertFalse(parts[1].is_final)
+
+    def test_lexer_comment_quote_and_same_line_close_tag(self):
+        """Verify quotes inside comments don't hide close tags and same-line close tags close the block."""
+        content = (
+            "Preamble\n<a2ui>\n# User's comment\ntext = 123 # done </a2ui>\nPostamble"
+        )
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, "# User's comment\ntext = 123 # done")
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+
+    def test_lexer_open_tag_with_attributes(self):
+        """Verify that open tags with attributes are correctly matched and parsed."""
+        content = (
+            'Preamble\n<a2ui id="main" surfaceId="foo">\ncode_here\n</a2ui>\nPostamble'
+        )
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, "code_here")
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+
+    def test_lexer_markdown_cleaning(self):
+        """Verify that markdown code block wrapper tags are stripped from conversational text parts."""
+        content = "Preamble\n```html\n<a2ui>\ncode_here\n</a2ui>\n```\nPostamble"
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, "code_here")
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+
+    def test_lexer_inner_markdown_cleaning(self):
+        """Verify that markdown code block wrappers inside the tag are stripped from the raw content."""
+        content = "Preamble\n<a2ui>\n```json\ncode_here\n```\n</a2ui>\nPostamble"
+        lexer = BlockLexer()
+        parts = lexer.tokenize(content)
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, "code_here")
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+
+    def test_lexer_unmatched_close_tag_with_fence_or_statements(self):
+        """Verify blocks opened with ```a2ui or missing <a2ui> before </a2ui> are recovered."""
+        fenced = (
+            'Preamble\n```a2ui\nsurface("main")\nroot ='
+            ' Text("Hi")\n</a2ui>\n```\nPostamble'
+        )
+        lexer = BlockLexer()
+        parts = lexer.tokenize(fenced)
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0].part.text, "Preamble")
+        self.assertEqual(parts[1].part.a2ui_raw, 'surface("main")\nroot = Text("Hi")')
+        self.assertTrue(parts[1].is_final)
+        self.assertEqual(parts[2].part.text, "Postamble")
+
+        unfenced = 'Here is the UI.\nsurface("main")\nroot = Text("Hi")\n</a2ui>'
+        parts2 = lexer.tokenize(unfenced)
+        self.assertEqual(len(parts2), 2)
+        self.assertEqual(parts2[0].part.text, "Here is the UI.")
+        self.assertEqual(parts2[1].part.a2ui_raw, 'surface("main")\nroot = Text("Hi")')
+        self.assertTrue(parts2[1].is_final)
+
+    def test_lexer_rejects_empty_block_comment_markers(self):
+        """Verify an empty block comment marker is rejected."""
+        with self.assertRaises(ValueError):
+            BlockLexer(block_comments=[("", "*/")])
+        with self.assertRaises(ValueError):
+            BlockLexer(block_comments=[("/*", "")])
+
+
+if __name__ == "__main__":
+    unittest.main()

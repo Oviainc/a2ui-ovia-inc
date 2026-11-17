@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -69,11 +69,11 @@ def archive_run(
     format_name: str,
     hypothesis: str,
     status: str,
-    notes: Optional[str] = None,
-    log_dir: Optional[str] = None,
-    custom_history_dir: Optional[str] = None,
-    model: str = "google/gemini-3.8-flash",
-    thinking_budget: Optional[int] = None,
+    notes: str | None = None,
+    log_dir: str | None = None,
+    custom_history_dir: str | None = None,
+    model: str = "google/gemini-3.6-flash",
+    thinking_budget: int | None = None,
 ) -> str:
     """Atomically archives optimization run artifacts into the history directory.
 
@@ -98,7 +98,7 @@ def archive_run(
     else:
         detected_root = None
         for p in [skill_dir] + list(skill_dir.parents):
-            if (p / "specification").exists() and (p / "agent_sdks").exists():
+            if (p / "specification").exists() and (p / "python").exists():
                 detected_root = p
                 break
         if detected_root:
@@ -173,7 +173,7 @@ def archive_run(
         reverse=True,
     )
 
-    metrics_extracted: Dict[str, Any] = {}
+    metrics_extracted: dict[str, Any] = {}
     results_json_src = os.path.join(temp_dir, "results.json")
     if os.path.exists(results_json_src):
         try:
@@ -192,7 +192,8 @@ def archive_run(
                 json.dump(log_data, f, indent=2)
         except Exception as e:
             print(
-                f"Warning: Could not load eval log {eval_logs[0]}: {e}", file=sys.stderr
+                f"Warning: Could not load eval log {eval_logs[0]}: {e}",
+                file=sys.stderr,
             )
 
     if not metrics_extracted and os.path.exists(
@@ -206,7 +207,8 @@ def archive_run(
                 metrics_extracted = meta_json.get("metrics", {})
         except Exception as e:
             print(
-                f"Warning: Could not load fallback run_meta.json: {e}", file=sys.stderr
+                f"Warning: Could not load fallback run_meta.json: {e}",
+                file=sys.stderr,
             )
 
     meta_payload = {

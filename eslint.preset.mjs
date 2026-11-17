@@ -28,6 +28,7 @@ export default [
       // Common monorepo rule relaxations
       eqeqeq: ['error', 'always', {null: 'ignore'}],
       'no-undef': 'off',
+      quotes: ['warn', 'single', {avoidEscape: true, allowTemplateLiterals: true}],
     },
   },
   {
@@ -45,6 +46,20 @@ export default [
         },
       ],
       '@typescript-eslint/ban-ts-comment': 'error',
+    },
+  },
+  {
+    files: ['**/*.ts', '**/*.tsx', '**/*.mts', '**/*.cts'],
+    ignores: ['**/v0_8/**', '**/0.8/**', '**/v0_9/schema/index.ts', '**/v1_0/schema/index.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'ExportAllDeclaration[exported=null]',
+          message:
+            'Avoid wildcard barrel exports (`export *`). Use explicit named exports (`export { ... }`) or namespace exports (`export * as ...`).',
+        },
+      ],
     },
   },
   {

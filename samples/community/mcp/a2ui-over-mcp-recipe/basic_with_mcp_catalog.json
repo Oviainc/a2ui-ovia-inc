@@ -1243,7 +1243,7 @@
     },
     "callMcpTool": {
       "type": "object",
-      "description": "Executes a tool on a connected Model Context Protocol (MCP) server.",
+      "description": "Invokes a tool on a connected Model Context Protocol (MCP) server and returns the result.",
       "properties": {
         "call": {
           "const": "callMcpTool"
@@ -1252,14 +1252,14 @@
           "type": "object",
           "properties": {
             "name": {
-              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicString",
+              "$ref": "common_types.json#/$defs/DynamicString",
               "description": "The name of the MCP tool to execute."
             },
             "arguments": {
               "type": "object",
               "description": "The arguments to pass to the MCP tool.",
               "additionalProperties": {
-                "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicValue"
+                "$ref": "common_types.json#/$defs/DynamicValue"
               }
             }
           },

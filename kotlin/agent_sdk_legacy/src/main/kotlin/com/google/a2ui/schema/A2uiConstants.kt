@@ -45,10 +45,12 @@ object A2uiConstants {
   const val VERSION_0_9 = "0.9"
   const val VERSION_0_9_1 = "0.9.1"
 
-  const val A2UI_OPEN_TAG = "<a2ui-json>"
-  const val A2UI_CLOSE_TAG = "</a2ui-json>"
-  const val A2UI_INFERENCE_OPEN_TAG = "<a2ui>"
-  const val A2UI_INFERENCE_CLOSE_TAG = "</a2ui>"
+  const val A2UI_JSON_TAG_NAME = "a2ui-json"
+  const val A2UI_OPEN_TAG = "<$A2UI_JSON_TAG_NAME>"
+  const val A2UI_CLOSE_TAG = "</$A2UI_JSON_TAG_NAME>"
+  const val A2UI_INFERENCE_TAG_NAME = "a2ui"
+  const val A2UI_INFERENCE_OPEN_TAG = "<$A2UI_INFERENCE_TAG_NAME>"
+  const val A2UI_INFERENCE_CLOSE_TAG = "</$A2UI_INFERENCE_TAG_NAME>"
 
   const val A2UI_SCHEMA_BLOCK_START = "---BEGIN A2UI JSON SCHEMA---"
   const val A2UI_SCHEMA_BLOCK_END = "---END A2UI JSON SCHEMA---"
@@ -59,6 +61,6 @@ object A2uiConstants {
     1.  The response can contain one or more A2UI JSON blocks.
     2.  Each A2UI JSON block MUST be wrapped in $A2UI_OPEN_TAG and $A2UI_CLOSE_TAG tags.
     3.  Between or around these blocks, you can provide conversational text.
-    4.  The JSON part MUST be a single, raw JSON object (usually a list of A2UI messages) and MUST validate against the provided A2UI JSON SCHEMA.
+    4.  The JSON part MUST be a JSON array of A2UI messages, each following the provided A2UI JSON SCHEMA.
     """
 }

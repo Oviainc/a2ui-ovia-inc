@@ -1,0 +1,895 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+from typing import Any, cast
+
+import pytest
+
+from a2ui.core.basic_catalog import v1_0
+from a2ui.core.catalog import Catalog, FunctionApi, FunctionImplementation
+from a2ui.core.exceptions import A2uiRpcError, RpcErrorCode
+from a2ui.core.resolution import DataContext
+from a2ui.core.rpc import CallOptions, RpcHandler
+from a2ui.core.schema.v1_0 import CallRendererFunction, CallRendererFunctionMessage
+from a2ui.core.schema.v1_0.common_types import FunctionCall
+from a2ui.core.state import SurfaceModel
+
+
+def test_rpc_handler_initialization_and_disposal() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], default_timeout_ms=5000.0)
+
+    assert not handler.disposed
+    handler.dispose()
+    assert handler.disposed
+
+    from a2ui.core.schema.v1_0 import CallRendererFunction, CallRendererFunctionMessage
+    from a2ui.core.schema.v1_0.common_types import FunctionCall
+
+    resp = handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-1",
+                call_function=FunctionCall(call="someFunc", catalog_id="basic"),
+            ),
+        ),
+        context=None,
+    )
+    assert resp["rendererFunctionResponse"]["error"]["code"] == "DISPOSED"
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_outbound_call_agent_function() -> None:
+    sent_msgs: list[dict[str, Any]] = []
+
+    def outbound_listener(msg: dict[str, Any]) -> None:
+        sent_msgs.append(msg)
+
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=outbound_listener)
+
+    from a2ui.core.rpc import CallOptions
+    from a2ui.core.schema.v1_0.common_types import FunctionCall
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="fetchData", args={"query": "test"}),
+        options=CallOptions(function_call_id="call-123"),
+    )
+
+    assert len(sent_msgs) == 1
+    assert sent_msgs[0]["callAgentFunction"]["functionCallId"] == "call-123"
+
+    handler.handle_agent_function_response({
+        "agentFunctionResponse": {
+            "functionCallId": "call-123",
+            "value": {"status": "ok"},
+        }
+    })
+
+    result = await fut
+    assert result == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_outbound_timeout() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler(
+        [cat], outbound_listener=lambda msg: None, default_timeout_ms=50.0
+    )
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="slowCall"),
+        options=CallOptions(function_call_id="call-timeout"),
+    )
+
+    with pytest.raises(A2uiRpcError) as exc_info:
+        await fut
+
+    assert exc_info.value.code == RpcErrorCode.TIMEOUT.value
+
+
+def test_rpc_handler_non_callable_function() -> None:
+    func_bad = FunctionApi(
+        name="badFn",
+        allowed_callers="agentOnly",
+    )
+    cat = Catalog("basic", protocol_version="1.0", functions=[func_bad])
+    handler = RpcHandler([cat])
+
+    resp = handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-bad",
+                call_function=FunctionCall(call="badFn", catalog_id="basic"),
+            ),
+        )
+    )
+    assert resp["rendererFunctionResponse"]["error"]["code"] == "EXECUTION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_future_cancellation_cleanup() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler(
+        [cat], outbound_listener=lambda msg: None, default_timeout_ms=5000.0
+    )
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="slowCall"),
+        options=CallOptions(function_call_id="call-cancel"),
+    )
+
+    assert "call-cancel" in handler._pending_agent_calls
+    fut.cancel()
+
+    # Give event loop a tick to process done callbacks
+    await asyncio.sleep(0)
+    assert "call-cancel" not in handler._pending_agent_calls
+
+
+def test_rpc_handler_duplicate_call_id_rejection() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler(
+        [cat], outbound_listener=lambda msg: None, default_timeout_ms=5000.0
+    )
+
+    handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="func1"),
+        options=CallOptions(function_call_id="dup-call-1"),
+    )
+
+    with pytest.raises(A2uiRpcError) as exc_info:
+        handler.call_agent_function(
+            surface_id="s1",
+            call=FunctionCall(call="func2"),
+            options=CallOptions(function_call_id="dup-call-1"),
+        )
+    assert exc_info.value.code == RpcErrorCode.DUPLICATE.value
+
+
+def test_rpc_handler_missing_outbound_listener() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat])
+
+    with pytest.raises(A2uiRpcError) as exc_info:
+        handler.call_agent_function(
+            surface_id="s1",
+            call=FunctionCall(call="noListenerFunc"),
+        )
+    assert exc_info.value.code == RpcErrorCode.NO_LISTENER.value
+
+
+def test_rpc_handler_disposed_call_prevention() -> None:
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=lambda msg: None)
+    handler.dispose()
+
+    with pytest.raises(A2uiRpcError) as exc_info:
+        handler.call_agent_function(
+            surface_id="s1",
+            call=FunctionCall(call="disposedFunc"),
+        )
+    assert exc_info.value.code == RpcErrorCode.DISPOSED.value
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_async_function_execution() -> None:
+    async def async_fn(args: dict[str, Any], context: DataContext | None = None) -> str:
+        await asyncio.sleep(0.01)
+        return f"Async result: {args.get('val')}"
+
+    func_impl = FunctionImplementation(
+        name="asyncFunc",
+        execute=async_fn,
+        allowed_callers="agentOnly",
+    )
+    cat = Catalog("basic", protocol_version="1.0", functions=[func_impl])
+    handler = RpcHandler([cat])
+
+    resp = await handler.handle_call_renderer_function_async(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-async-1",
+                call_function=FunctionCall(
+                    call="asyncFunc", catalog_id="basic", args={"val": "test"}
+                ),
+            ),
+        )
+    )
+    assert resp["rendererFunctionResponse"]["value"] == "Async result: test"
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_async_function_exception_handling() -> None:
+    async def throwing_async_fn(
+        args: dict[str, Any], context: DataContext | None = None
+    ) -> str:
+        raise ValueError("Async execution failure")
+
+    func_impl = FunctionImplementation(
+        name="throwingAsyncFunc",
+        execute=throwing_async_fn,
+        allowed_callers="agentOnly",
+    )
+    cat = Catalog("basic", protocol_version="1.0", functions=[func_impl])
+    handler = RpcHandler([cat])
+
+    resp = await handler.handle_call_renderer_function_async(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-async-err",
+                call_function=FunctionCall(
+                    call="throwingAsyncFunc", catalog_id="basic"
+                ),
+            ),
+        )
+    )
+    assert (
+        resp["rendererFunctionResponse"]["error"]["code"]
+        == RpcErrorCode.EXECUTION_ERROR.value
+    )
+    assert (
+        "Async execution failure"
+        in resp["rendererFunctionResponse"]["error"]["message"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_async_outbound_listener_error() -> None:
+    async def bad_listener(msg: dict[str, Any]) -> None:
+        raise RuntimeError("Transport failed")
+
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=bad_listener)
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="testCall"),
+        options=CallOptions(function_call_id="call-listener-err"),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await fut
+    assert "Transport failed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_async_outbound_listener_success_resolves_response() -> None:
+    from a2ui.core.schema.v1_0 import (
+        AgentFunctionResponse,
+        AgentFunctionResponseMessage,
+    )
+
+    sent_messages: list[dict[str, Any]] = []
+
+    async def async_listener(msg: dict[str, Any]) -> None:
+        await asyncio.sleep(0.01)
+        sent_messages.append(msg)
+
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=async_listener)
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="fetchData"),
+        options=CallOptions(function_call_id="call-async-send-1"),
+    )
+
+    # Let async transmission finish
+    await asyncio.sleep(0.03)
+    assert len(sent_messages) == 1
+    # Pending call must still be active and not prematurely popped
+    assert not fut.done()
+
+    # Inbound response arrives from agent
+    handler.handle_agent_function_response(
+        AgentFunctionResponseMessage(
+            version="1.0",
+            agentFunctionResponse=AgentFunctionResponse(
+                functionCallId="call-async-send-1",
+                value={"status": "received_ok"},
+            ),
+        )
+    )
+
+    result = await fut
+    assert result == {"status": "received_ok"}
+
+
+def test_rpc_handler_handle_agent_function_response_pydantic_model() -> None:
+    from a2ui.core.schema.v1_0 import AgentFunctionResponse, AgentFunctionResponseMessage
+
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=lambda msg: None)
+
+    fut = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="fetchData"),
+        options=CallOptions(function_call_id="call-pydantic-1"),
+    )
+
+    model_resp = AgentFunctionResponseMessage(
+        version="1.0",
+        agentFunctionResponse=AgentFunctionResponse(
+            functionCallId="call-pydantic-1",
+            value={"data": "pydantic_success"},
+        ),
+    )
+
+    handler.handle_agent_function_response(model_resp)
+    assert fut.done()
+    assert fut.result() == {"data": "pydantic_success"}
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_sync_execution_of_async_function_in_running_loop() -> None:
+    async def async_fn(args: dict[str, Any], context: DataContext | None = None) -> str:
+        await asyncio.sleep(0.01)
+        return "Async via sync bridge"
+
+    func_impl = FunctionImplementation(
+        name="asyncBridgeFunc",
+        execute=async_fn,
+        allowed_callers="agentOnly",
+    )
+    cat = Catalog("basic", protocol_version="1.0", functions=[func_impl])
+    handler = RpcHandler([cat])
+
+    # Call sync handle_call_renderer_function while an asyncio event loop is running
+    resp = handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-bridge-1",
+                call_function=FunctionCall(call="asyncBridgeFunc", catalog_id="basic"),
+            ),
+        )
+    )
+    assert resp["rendererFunctionResponse"]["value"] == "Async via sync bridge"
+
+
+def test_rpc_handler_passes_validated_and_coerced_args_to_target_fn() -> None:
+    from pydantic import BaseModel
+
+    class MathArgs(BaseModel):
+        num: int
+        multiplier: int = 10
+
+    received_args: dict[str, Any] = {}
+
+    def compute(args: dict[str, Any], context: DataContext | None = None) -> int:
+        received_args.update(args)
+        return args["num"] * args["multiplier"]
+
+    func_impl = FunctionImplementation(
+        name="computeValue",
+        schema=MathArgs,
+        execute=compute,
+        allowed_callers="agentOnly",
+    )
+    cat = Catalog("math", protocol_version="1.0", functions=[func_impl])
+    handler = RpcHandler([cat])
+
+    # Call with string num that needs coercion ("5" -> 5) and omitting multiplier (default 10)
+    resp = handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-coerce-1",
+                call_function=FunctionCall(
+                    call="computeValue",
+                    catalog_id="math",
+                    args={"num": "5"},
+                ),
+            ),
+        )
+    )
+    assert resp["rendererFunctionResponse"]["value"] == 50
+    # Confirm target function actually received the coerced arguments with defaults applied
+    assert received_args == {"num": 5, "multiplier": 10}
+
+
+def test_a2ui_rpc_error_constructor_parameter_order() -> None:
+    # Standard order: (message, code, function_call_id)
+    err1 = A2uiRpcError("Call timed out", RpcErrorCode.TIMEOUT, "call-1")
+    assert str(err1) == "Call timed out"
+    assert err1.code == "TIMEOUT"
+    assert err1.function_call_id == "call-1"
+
+    # Default code is UNKNOWN_ERROR
+    err2 = A2uiRpcError("Something failed")
+    assert str(err2) == "Something failed"
+    assert err2.code == "UNKNOWN_ERROR"
+    assert err2.function_call_id is None
+
+    # Swapped (code, message) is normalized automatically
+    err3 = A2uiRpcError(RpcErrorCode.CANCELLED, "Operation cancelled", "call-2")
+    assert str(err3) == "Operation cancelled"
+    assert err3.code == "CANCELLED"
+    assert err3.function_call_id == "call-2"
+
+    # Uppercase message matching a known code with a custom uppercase code is NOT swapped
+    err4 = A2uiRpcError("TIMEOUT", "SERVER_FAULT", "call-3")
+    assert str(err4) == "TIMEOUT"
+    assert err4.code == "SERVER_FAULT"
+    assert err4.function_call_id == "call-3"
+
+
+@pytest.mark.asyncio
+async def test_call_renderer_function_surface_id_resolution() -> None:
+    from a2ui.core.processing import MessageProcessor
+
+    def read_name(args: dict[str, Any], context: DataContext | None = None) -> str:
+        if "text" in args:
+            return args["text"] or "empty"
+        if context is None or context.data_model is None:
+            return "empty"
+        return context.data_model.get("/user/name") or "empty"
+
+    fn = FunctionImplementation(
+        name="readUserName",
+        execute=read_name,
+        allowed_callers="rendererOrAgent",
+    )
+    cat = Catalog("rpc-model-cat", protocol_version="1.0", functions=[fn])
+    proc = MessageProcessor([cat])
+
+    proc.process_messages([
+        {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s1",
+                "catalogId": "rpc-model-cat",
+                "dataModel": {"user": {"name": "Alice"}},
+            },
+        },
+        {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s2",
+                "catalogId": "rpc-model-cat",
+                "dataModel": {"user": {"name": "Bob"}},
+            },
+        },
+    ])
+
+    # 1. With surfaceId="s2" and @path arg -> resolves against s2's data model ("Bob")
+    res_with_surface = await proc.process_messages_async({
+        "version": "1.0",
+        "callRendererFunction": {
+            "surfaceId": "s2",
+            "functionCallId": "rpc-surf-1",
+            "callFunction": {
+                "@call": "readUserName",
+                "catalogId": "rpc-model-cat",
+                "args": {"text": {"@path": "/user/name"}},
+            },
+        },
+    })
+    assert len(res_with_surface) == 1
+    assert res_with_surface[0]["rendererFunctionResponse"]["value"] == "Bob"
+
+    # 2. Without surfaceId and @path arg -> resolves against isolated empty root model ("empty")
+    res_isolated = await proc.process_messages_async({
+        "version": "1.0",
+        "callRendererFunction": {
+            "functionCallId": "rpc-surf-2",
+            "callFunction": {
+                "@call": "readUserName",
+                "catalogId": "rpc-model-cat",
+                "args": {"text": {"@path": "/user/name"}},
+            },
+        },
+    })
+    assert len(res_isolated) == 1
+    assert res_isolated[0]["rendererFunctionResponse"]["value"] == "empty"
+
+    # 3. With non-existent surfaceId -> returns INVALID_FUNCTION_CALL
+    res_missing = await proc.process_messages_async({
+        "version": "1.0",
+        "callRendererFunction": {
+            "surfaceId": "non_existent_surface",
+            "functionCallId": "rpc-surf-3",
+            "callFunction": {
+                "@call": "readUserName",
+                "catalogId": "rpc-model-cat",
+                "args": {},
+            },
+        },
+    })
+    assert len(res_missing) == 1
+    assert (
+        res_missing[0]["rendererFunctionResponse"]["error"]["code"]
+        == RpcErrorCode.INVALID_FUNCTION_CALL.value
+    )
+    assert (
+        "Surface not found: non_existent_surface"
+        in res_missing[0]["rendererFunctionResponse"]["error"]["message"]
+    )
+
+    # 4. With @call: "@index" in args -> returns EXECUTION_ERROR
+    res_index_err = await proc.process_messages_async({
+        "version": "1.0",
+        "callRendererFunction": {
+            "functionCallId": "rpc-surf-4",
+            "callFunction": {
+                "@call": "readUserName",
+                "catalogId": "rpc-model-cat",
+                "args": {"text": {"@call": "@index"}},
+            },
+        },
+    })
+    assert len(res_index_err) == 1
+    assert (
+        res_index_err[0]["rendererFunctionResponse"]["error"]["code"]
+        == RpcErrorCode.EXECUTION_ERROR.value
+    )
+
+    # 5. Omitting catalogId on wire message is rejected by schema validation even with surfaceId
+    from a2ui.core.exceptions import A2uiValidationError
+
+    with pytest.raises(A2uiValidationError, match="catalogId"):
+        await proc.process_messages_async({
+            "version": "1.0",
+            "callRendererFunction": {
+                "surfaceId": "s1",
+                "functionCallId": "rpc-surf-5",
+                "callFunction": {
+                    "@call": "readUserName",
+                    "args": {},
+                },
+            },
+        })
+
+    # 6. Direct RpcHandler invocation without catalogId rejects with INVALID_FUNCTION_CALL
+    # even when the DataContext has a surface with a defaultCatalog
+    s1_surface = proc.model.get_surface("s1")
+    assert s1_surface is not None
+    unvalidated_msg = CallRendererFunctionMessage.model_construct(
+        version="1.0",
+        call_renderer_function=CallRendererFunction.model_construct(
+            surface_id="s1",
+            function_call_id="rpc-surf-6",
+            call_function=FunctionCall(call="readUserName"),
+        ),
+    )
+    direct_handler = RpcHandler([cat])
+    direct_res = await direct_handler.handle_call_renderer_function_async(
+        unvalidated_msg,
+        context=DataContext(surface=s1_surface, path="/"),
+    )
+    assert (
+        direct_res["rendererFunctionResponse"]["error"]["code"]
+        == RpcErrorCode.INVALID_FUNCTION_CALL.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_dispose_cancels_rejects_and_clears_listener() -> None:
+    sent: list[dict[str, Any]] = []
+    cat = Catalog("basic", protocol_version="1.0")
+    handler = RpcHandler([cat], outbound_listener=sent.append)
+    pending = handler.call_agent_function(
+        surface_id="s1",
+        call=FunctionCall(call="fetchData"),
+        options=CallOptions(function_call_id="call-pending"),
+    )
+
+    handler.dispose()
+
+    assert handler.outbound_listener is None
+    with pytest.raises(A2uiRpcError) as cancelled:
+        await pending
+    assert cancelled.value.code == RpcErrorCode.CANCELLED.value
+    with pytest.raises(A2uiRpcError) as refused:
+        handler.call_agent_function(surface_id="s1", call=FunctionCall(call="later"))
+    assert refused.value.code == RpcErrorCode.DISPOSED.value
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_rpc_handler_concurrent_async_calls_isolate_active_catalog_id() -> None:
+    started_a = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def slow_fn(
+        args: dict[str, Any], context: DataContext | None = None
+    ) -> list[str | None]:
+        assert context is not None
+        before = context.active_catalog_id
+        started_a.set()
+        await release_a.wait()
+        return [before, context.active_catalog_id]
+
+    async def fast_fn(
+        args: dict[str, Any], context: DataContext | None = None
+    ) -> str | None:
+        assert context is not None
+        await started_a.wait()
+        seen = context.active_catalog_id
+        release_a.set()
+        return seen
+
+    cat_a = Catalog(
+        "cat-a",
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="slowFn", execute=slow_fn, allowed_callers="agentOnly"
+            )
+        ],
+    )
+    cat_b = Catalog(
+        "cat-b",
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="fastFn", execute=fast_fn, allowed_callers="agentOnly"
+            )
+        ],
+    )
+    surface = SurfaceModel(
+        "s1",
+        default_catalog=None,
+        available_catalogs={"cat-a": cat_a, "cat-b": cat_b},
+        protocol_version="1.0",
+    )
+    shared_ctx = DataContext(surface=surface, path="/")
+    handler = RpcHandler([cat_a, cat_b])
+
+    resp_a, resp_b = await asyncio.gather(
+        handler.handle_call_renderer_function_async(
+            CallRendererFunctionMessage(
+                version="1.0",
+                call_renderer_function=CallRendererFunction(
+                    function_call_id="call-a",
+                    call_function=FunctionCall(call="slowFn", catalog_id="cat-a"),
+                ),
+            ),
+            context=shared_ctx,
+        ),
+        handler.handle_call_renderer_function_async(
+            CallRendererFunctionMessage(
+                version="1.0",
+                call_renderer_function=CallRendererFunction(
+                    function_call_id="call-b",
+                    call_function=FunctionCall(call="fastFn", catalog_id="cat-b"),
+                ),
+            ),
+            context=shared_ctx,
+        ),
+    )
+
+    assert resp_a["rendererFunctionResponse"]["value"] == ["cat-a", "cat-a"]
+    assert resp_b["rendererFunctionResponse"]["value"] == "cat-b"
+    assert shared_ctx.active_catalog_id is None
+
+
+def test_rpc_handler_standalone_catalog_resolves_nested_template_calls() -> None:
+    basic_format_string = v1_0.BasicCatalog().get_function("formatString")
+    assert basic_format_string is not None
+
+    rpc_cat = Catalog(
+        "rpc-only-cat",
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="renderTemplate",
+                execute=lambda args, context=None, *_: basic_format_string.execute(
+                    args, context
+                ),
+                allowed_callers="agentOnly",
+            ),
+            FunctionImplementation(
+                name="rpcHelper",
+                execute=lambda args, context=None, *_: "from-rpc-cat",
+                allowed_callers="rendererOrAgent",
+            ),
+        ],
+    )
+    surface_cat = Catalog("surface-cat", protocol_version="1.0")
+    surface = SurfaceModel(
+        "s-rpc-standalone",
+        default_catalog=surface_cat,
+        available_catalogs={"surface-cat": surface_cat},
+        protocol_version="1.0",
+    )
+    ctx = DataContext(surface=surface, path="/")
+    handler = RpcHandler([rpc_cat])
+
+    resp = handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-standalone",
+                call_function=FunctionCall(
+                    call="renderTemplate",
+                    catalog_id="rpc-only-cat",
+                    args={"value": "Hello ${rpcHelper()}"},
+                ),
+            ),
+        ),
+        context=ctx,
+    )
+
+    assert resp["rendererFunctionResponse"]["value"] == "Hello from-rpc-cat"
+    assert ctx.active_catalog_id is None
+
+    # Dynamic @call in callFunction.args targeting the standalone RPC catalog resolves cleanly,
+    # whereas targeting an unnegotiated third catalog fails with EXECUTION_ERROR.
+    echo_cat = Catalog(
+        "rpc-echo-cat",
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="echoLabel",
+                execute=lambda args, context=None, *_: args.get("label"),
+                allowed_callers="agentOnly",
+            ),
+            FunctionImplementation(
+                name="renderTemplate",
+                execute=lambda args, context=None, *_: basic_format_string.execute(
+                    args, context
+                ),
+                allowed_callers="rendererOrAgent",
+            ),
+            FunctionImplementation(
+                name="rpcHelper",
+                execute=lambda args, context=None, *_: "arg-rpc-val",
+                allowed_callers="rendererOrAgent",
+            ),
+        ],
+    )
+    other_rpc_cat = Catalog(
+        "other-unnegotiated-cat",
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="secretHelper",
+                execute=lambda args, context=None, *_: "leaked",
+                allowed_callers="rendererOrAgent",
+            ),
+        ],
+    )
+    echo_handler = RpcHandler([echo_cat, other_rpc_cat])
+    arg_resp = echo_handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-standalone-arg",
+                call_function=FunctionCall(
+                    call="echoLabel",
+                    catalog_id="rpc-echo-cat",
+                    args={
+                        "label": {
+                            "@call": "renderTemplate",
+                            "catalogId": "rpc-echo-cat",
+                            "args": {"value": "Arg: ${rpcHelper()}"},
+                        }
+                    },
+                ),
+            ),
+        ),
+        context=ctx,
+    )
+    assert arg_resp["rendererFunctionResponse"]["value"] == "Arg: arg-rpc-val"
+
+    bad_arg_resp = echo_handler.handle_call_renderer_function(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-unnegotiated-arg",
+                call_function=FunctionCall(
+                    call="echoLabel",
+                    catalog_id="rpc-echo-cat",
+                    args={
+                        "label": {
+                            "@call": "secretHelper",
+                            "catalogId": "other-unnegotiated-cat",
+                            "args": {},
+                        }
+                    },
+                ),
+            ),
+        ),
+        context=ctx,
+    )
+    assert (
+        bad_arg_resp["rendererFunctionResponse"]["error"]["code"] == "EXECUTION_ERROR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_renderer_function_prefers_executable_rpc_catalog_over_schema_only_surface_catalog() -> (
+    None
+):
+    basic_cat = v1_0.BasicCatalog()
+    basic_format_string = basic_cat.get_function("formatString")
+    assert basic_format_string is not None
+
+    shared_id = "https://example.com/catalogs/shared/v1/catalog.json"
+    schema_only_surface_cat = Catalog.from_json(
+        {
+            "catalogId": shared_id,
+            "protocolVersion": "1.0",
+            "components": {},
+            "functions": {
+                "renderTemplate": {
+                    "returnType": "string",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                    },
+                },
+                "rpcHelper": {
+                    "returnType": "string",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        },
+        protocol_version="1.0",
+    )
+    executable_rpc_cat = Catalog(
+        shared_id,
+        protocol_version="1.0",
+        functions=[
+            FunctionImplementation(
+                name="renderTemplate",
+                execute=lambda args, context=None, *_: basic_format_string.execute(
+                    args, context
+                ),
+                allowed_callers="rendererOrAgent",
+            ),
+            FunctionImplementation(
+                name="rpcHelper",
+                execute=lambda args, context=None, *_: "from-executable-rpc",
+                allowed_callers="rendererOrAgent",
+            ),
+        ],
+    )
+    surface = SurfaceModel(
+        "s-schema-only",
+        default_catalog=schema_only_surface_cat,
+        available_catalogs={shared_id: schema_only_surface_cat},
+        protocol_version="1.0",
+    )
+    ctx = DataContext(surface=surface, path="/")
+    handler = RpcHandler([executable_rpc_cat])
+
+    resp = await handler.handle_call_renderer_function_async(
+        CallRendererFunctionMessage(
+            version="1.0",
+            call_renderer_function=CallRendererFunction(
+                function_call_id="call-same-id-async",
+                call_function=FunctionCall(
+                    call="renderTemplate",
+                    catalog_id=shared_id,
+                    args={"value": "Hello ${rpcHelper()}"},
+                ),
+            ),
+        ),
+        context=ctx,
+    )
+
+    assert resp["rendererFunctionResponse"]["value"] == "Hello from-executable-rpc"
+    assert ctx.active_catalog_id is None

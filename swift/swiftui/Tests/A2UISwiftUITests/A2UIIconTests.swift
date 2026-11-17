@@ -47,6 +47,23 @@ struct A2UIIconTests {
     )
 
     let view = A2UIIcon(node: node)
+    #expect(view.iconSource == .svg("M10 10 H 90 V 90 H 10 Z"))
+    _ = view.body
+  }
+
+  @Test func iconInitializesWithUnprefixedPathKey() {
+    let node = Node(
+      id: "iconUnprefixedPath",
+      type: "Icon",
+      properties: [
+        "name": ResolvedDictionary([
+          "path": "M0 0 L10 10 Z"
+        ])
+      ]
+    )
+
+    let view = A2UIIcon(node: node)
+    #expect(view.iconSource == .svg("M0 0 L10 10 Z"))
     _ = view.body
   }
 
@@ -54,6 +71,18 @@ struct A2UIIconTests {
     let path = SVGPathParser.parse(
       "M0 0 L10 10 H20 V30 C1 2 3 4 5 6 S7 8 9 10 Q11 12 13 14 T15 16 Z")
     #expect(!path.isEmpty)
+  }
+
+  @Test func svgPathParserHandlesScientificNotationAndPlusDelimitedCoordinates() {
+    let path = SVGPathParser.parse("M1e1+20 L30+4e1 Z")
+    #expect(path.boundingRect == CGRect(x: 10, y: 20, width: 20, height: 20))
+  }
+
+  @Test func svgPathShapeScalesAndCentersPathInRect() {
+    let shape = SVGPathShape(pathData: "M0 0 H12 V12 H0 Z")
+    let fitted = shape.path(in: CGRect(x: 0, y: 0, width: 48, height: 48))
+    // Reference size is max(12, 12, 24) = 24, so scale = 48 / 24 = 2 (24x24 centered in 48x48).
+    #expect(fitted.boundingRect == CGRect(x: 12, y: 12, width: 24, height: 24))
   }
 
   @Test func iconDataBoundSVGPathRendersEndToEnd() async throws {

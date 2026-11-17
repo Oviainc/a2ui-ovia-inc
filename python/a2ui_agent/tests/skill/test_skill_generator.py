@@ -1,0 +1,355 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for A2UI SkillGenerator API."""
+
+import os
+import tempfile
+import unittest
+from unittest.mock import MagicMock
+
+from a2ui.core import A2uiValidationError, Catalog
+from a2ui.inference_formats.direct_json import DirectJsonFormat
+from a2ui.inference_formats.express import ExpressFormat
+from a2ui.processor import CatalogConfig
+from a2ui.skill import Skill, SkillGenerator, SkillSet
+
+from ..repo_paths import find_repo_root
+
+# Locate standard basic catalog in repository
+_repo_root = find_repo_root(os.path.dirname(__file__)) or ""
+SPEC_DIR = os.path.join(_repo_root, "specification", "v1_0")
+CATALOGS_DIR = os.path.join(_repo_root, "catalogs", "basic")
+CATALOG_PATH = os.path.join(CATALOGS_DIR, "v1", "catalog.json")
+
+
+class TestSkillGenerator(unittest.TestCase):
+    """Tests SkillGenerator compilation methods."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.catalog_config = CatalogConfig.from_path(CATALOG_PATH)
+        self.catalog = self.catalog_config.transformed_catalog
+        self.express_fmt = ExpressFormat([self.catalog])
+        self.generator = SkillGenerator(self.express_fmt)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_generate_skill_monolithic(self):
+        """Verifies SkillGenerator.generate_skill() creating a monolithic Skill object."""
+        skill_obj = self.generator.generate_skill(name="a2ui-custom-monolithic")
+
+        self.assertEqual(skill_obj.name, "a2ui-custom-monolithic")
+        self.assertIn("a2ui-custom-monolithic", skill_obj.filename)
+        content = skill_obj.to_markdown()
+        self.assertTrue(content.startswith("---"))
+        self.assertIn("A2UI Express DSL Output Contract", content)
+
+    def test_generate_catalog_skill(self):
+        """Verifies SkillGenerator.generate_catalog_skill() creating a catalog skill with clean LLM name."""
+        skill_obj = self.generator.generate_catalog_skill(self.catalog)
+
+        self.assertEqual(skill_obj.name, "a2ui-basic")
+        self.assertIn("a2ui-basic/SKILL.md", skill_obj.filename)
+        content = skill_obj.to_markdown()
+        self.assertIn("Positional Component Signatures", content)
+
+    def test_generate_core_skill(self):
+        """Verifies SkillGenerator.generate_core_skill() creating base grammar skill."""
+        core_skill = self.generator.generate_core_skill(name="a2ui-base-core")
+
+        self.assertEqual(core_skill.name, "a2ui-base-core")
+        self.assertIn("A2UI Express DSL Output Contract", core_skill.content)
+
+    def test_generate_skillset_modular(self):
+        """Verifies SkillGenerator.generate_skillset() generating modular skill package."""
+        skill_set = self.generator.generate_skillset()
+
+        self.assertIn("a2ui-core/SKILL.md", skill_set)
+        self.assertIn("a2ui-basic/SKILL.md", skill_set)
+        self.assertEqual(len(skill_set), 2)
+
+        core_sk = skill_set["a2ui-core"]
+        self.assertEqual(core_sk.name, "a2ui-core")
+
+        basic_sk = skill_set["a2ui-basic"]
+        self.assertEqual(basic_sk.name, "a2ui-basic")
+
+    def test_export_to_directory(self):
+        """Verifies exporting SkillSet to directory, ensuring stale skill files are wiped while sibling skills are preserved."""
+        # 1. Pre-populate directory with a stale file inside a matching skill folder, an unrelated sibling skill, and a root note
+        stale_core_dir = os.path.join(self.temp_dir.name, "a2ui-core")
+        os.makedirs(stale_core_dir, exist_ok=True)
+        stale_file = os.path.join(stale_core_dir, "stale_note.txt")
+        with open(stale_file, "w", encoding="utf-8") as f:
+            f.write("old data")
+
+        unrelated_skill_dir = os.path.join(self.temp_dir.name, "unrelated-custom-skill")
+        os.makedirs(unrelated_skill_dir, exist_ok=True)
+        unrelated_file = os.path.join(unrelated_skill_dir, "SKILL.md")
+        with open(unrelated_file, "w", encoding="utf-8") as f:
+            f.write("custom content")
+
+        root_note = os.path.join(self.temp_dir.name, "root_note.txt")
+        with open(root_note, "w", encoding="utf-8") as f:
+            f.write("keep me")
+
+        # 2. Export skillset
+        skill_set = self.generator.generate_skillset()
+        exported = skill_set.export_to_directory(self.temp_dir.name)
+
+        # 3. Assert skills were written
+        self.assertIn("a2ui-core/SKILL.md", exported)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.temp_dir.name, "a2ui-core", "SKILL.md"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.temp_dir.name, "a2ui-basic", "SKILL.md"))
+        )
+
+        # 4. Assert stale file in matching skill folder was wiped
+        self.assertFalse(os.path.exists(stale_file))
+
+        # 5. Assert unrelated sibling skill and root note were strictly preserved
+        self.assertTrue(os.path.exists(unrelated_file))
+        with open(unrelated_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "custom content")
+        self.assertTrue(os.path.exists(root_note))
+
+    def test_skill_rejects_filename_that_could_escape_export_directory(self):
+        """A filename that is absolute or has a '.', '..' or empty segment is rejected on construction."""
+        for filename in ("../x/SKILL.md", "/abs/SKILL.md", "a/./b.md", "a//b.md"):
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(
+                    A2uiValidationError, "must be a relative path"
+                ):
+                    Skill("bad", "d", "# Bad", filename=filename)
+        with self.assertRaisesRegex(A2uiValidationError, "must be a relative path"):
+            SkillSet({"../x/SKILL.md": Skill("ok", "d", "# Ok")})
+        # Accepted: nested relative paths and a bare file at the root.
+        self.assertEqual(
+            Skill("n", "d", "c", filename="a/b/SKILL.md").filename, "a/b/SKILL.md"
+        )
+        self.assertEqual(Skill("n", "d", "c", filename="FLAT.md").filename, "FLAT.md")
+
+    def test_filename_reassigned_after_construction_is_rejected(self):
+        """A filename reassigned later goes through the same check, in the setter and in add()."""
+        skill = Skill("ok", "d", "# Ok")
+        with self.assertRaisesRegex(A2uiValidationError, "must be a relative path"):
+            skill.filename = "../victim/SKILL.md"
+        self.assertEqual(skill.filename, "ok/SKILL.md")
+
+        # Bypassing the setter still cannot get a bad key into a SkillSet.
+        skill.__dict__["_filename"] = "../victim/SKILL.md"
+        with self.assertRaisesRegex(A2uiValidationError, "must be a relative path"):
+            SkillSet().add(skill)
+
+    def test_export_aborts_when_skill_directory_sits_under_symlink_leaving_output_dir(
+        self,
+    ):
+        """A symlinked parent that resolves outside output_dir aborts before anything is touched."""
+        base = tempfile.TemporaryDirectory()
+        self.addCleanup(base.cleanup)
+        victim_file = os.path.join(base.name, "victim", "skills", "nested", "keep.txt")
+        os.makedirs(os.path.dirname(victim_file))
+        with open(victim_file, "w", encoding="utf-8") as f:
+            f.write("keep me")
+        out = os.path.join(base.name, "out")
+        os.makedirs(out)
+        os.symlink(os.path.join(base.name, "victim"), os.path.join(out, "src"))
+
+        skill_set = SkillSet()
+        skill_set.add(Skill("ok", "d", "# Ok"))
+        skill_set.add(
+            Skill("nested", "d", "# Nested", filename="src/skills/nested/SKILL.md")
+        )
+        with self.assertRaisesRegex(A2uiValidationError, "through a symlink"):
+            skill_set.export_to_directory(out)
+
+        # Nothing was removed or written, not even for the unrelated skill.
+        with open(victim_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+        self.assertFalse(os.path.exists(os.path.join(out, "ok")))
+
+    def test_export_removes_symlink_at_skill_directory_instead_of_writing_through_it(
+        self,
+    ):
+        """A symlink where the skill directory belongs is unlinked, and its target is left alone."""
+        base = tempfile.TemporaryDirectory()
+        self.addCleanup(base.cleanup)
+        victim = os.path.join(base.name, "victim")
+        os.makedirs(victim)
+        with open(os.path.join(victim, "stale.txt"), "w", encoding="utf-8") as f:
+            f.write("keep me")
+        out = os.path.join(base.name, "out")
+        os.makedirs(out)
+        link = os.path.join(out, "a2ui-core")
+        os.symlink(victim, link)
+
+        skill_set = SkillSet()
+        skill_set.add(Skill("a2ui-core", "d", "# Core"))
+        skill_set.export_to_directory(out)
+
+        self.assertFalse(os.path.islink(link))
+        self.assertTrue(os.path.isfile(os.path.join(link, "SKILL.md")))
+        with open(os.path.join(victim, "stale.txt"), "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+        self.assertFalse(os.path.exists(os.path.join(victim, "SKILL.md")))
+
+    def test_export_replaces_regular_file_at_skill_directory_path(self):
+        """A regular file where the skill directory belongs is removed instead of failing the write."""
+        with tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, "a2ui-core"), "w", encoding="utf-8") as f:
+                f.write("not a directory")
+            skill_set = SkillSet()
+            skill_set.add(Skill("a2ui-core", "d", "# Core"))
+            skill_set.export_to_directory(out)
+            self.assertTrue(os.path.isfile(os.path.join(out, "a2ui-core", "SKILL.md")))
+
+    def test_skill_set_get_matching_rules(self):
+        """Verifies SkillSet.get matching rules (exact key, exact name, min-3-char substring)."""
+        skill_set = self.generator.generate_skillset()
+
+        # 1. Exact key match
+        self.assertIsNotNone(skill_set.get("a2ui-core/SKILL.md"))
+        self.assertEqual(skill_set.get("a2ui-core/SKILL.md").name, "a2ui-core")
+
+        # 2. Exact name match
+        self.assertIsNotNone(skill_set.get("a2ui-core"))
+        self.assertEqual(skill_set.get("a2ui-core").name, "a2ui-core")
+
+        # 3. Substring match with >= 3 characters
+        self.assertIsNotNone(skill_set.get("basic"))
+        self.assertEqual(skill_set.get("basic").name, "a2ui-basic")
+
+        # 4. Substring match with < 3 characters must NOT match
+        self.assertIsNone(skill_set.get("ba"))
+        self.assertIsNone(skill_set.get("c"))
+
+        # 5. Non-matching string returns None
+        self.assertIsNone(skill_set.get("nonexistent"))
+
+    def test_generate_catalog_skill_default(self):
+        """Verifies generate_catalog_skill() defaults to the catalog bound to the format."""
+        skill_obj = self.generator.generate_catalog_skill()
+        self.assertEqual(skill_obj.name, "a2ui-basic")
+        self.assertIn("Positional Component Signatures", skill_obj.content)
+
+    def test_generate_with_explicit_catalogs_override(self):
+        """Verifies methods accept explicit catalog arguments overriding format defaults."""
+        testing_catalog_path = os.path.join(SPEC_DIR, "test", "testing_catalog.json")
+        testing_catalog = CatalogConfig.from_path(
+            testing_catalog_path, protocol_version="1.0"
+        ).transformed_catalog
+
+        # 1. generate_catalog_skill with explicit catalog generates for that catalog
+        cat_skill = self.generator.generate_catalog_skill(testing_catalog)
+        self.assertEqual(cat_skill.name, "a2ui-specification")
+
+        # 2. generate_skillset with explicit catalogs only includes the specified catalog
+        skill_set = self.generator.generate_skillset(catalogs=[testing_catalog])
+        self.assertEqual(len(skill_set), 2)
+        self.assertIn("a2ui-core/SKILL.md", skill_set)
+        self.assertIn("a2ui-specification/SKILL.md", skill_set)
+        self.assertNotIn("a2ui-basic/SKILL.md", skill_set)
+
+        # 3. generate_skill with explicit catalogs only includes the specified catalog
+        mono_skill = self.generator.generate_skill(catalogs=[testing_catalog])
+        self.assertIn("TestComponent(value)", mono_skill.content)
+        self.assertNotIn("Button(", mono_skill.content)
+
+    def test_generate_core_skill_with_none_rules(self):
+        """Verifies generate_core_skill() handles prompt_generator returning None defensively."""
+        mock_fmt = MagicMock()
+        mock_fmt.prompt_generator.generate_base_rules.return_value = None
+        gen = SkillGenerator(mock_fmt)
+        skill = gen.generate_core_skill()
+        self.assertEqual(skill.content, "\n")
+
+    def test_generate_catalog_skill_with_none_instructions(self):
+        """Verifies generate_catalog_skill() handles prompt_generator returning None defensively."""
+        mock_fmt = MagicMock()
+        mock_fmt.prompt_generator.generate_catalog_instructions.return_value = None
+        mock_fmt.prompt_generator.generate_examples.return_value = None
+        mock_fmt.catalogs = [self.catalog]
+        gen = SkillGenerator(mock_fmt)
+        skill = gen.generate_catalog_skill(self.catalog)
+        self.assertEqual(skill.content, "\n")
+
+    def test_examples_shared_by_catalogs_are_added_once(self):
+        """Verifies examples the format returns for every catalog aren't repeated."""
+        other = Catalog.from_json(
+            catalog_schema={
+                "catalogId": "https://a2ui.org/other",
+                "components": {},
+            },
+            protocol_version="1.0",
+        )
+        mock_fmt = MagicMock()
+        mock_fmt.catalogs = [self.catalog, other]
+        mock_fmt.prompt_generator.generate_base_rules.return_value = "RULES"
+        mock_fmt.prompt_generator.generate_catalog_instructions.return_value = "INST"
+        mock_fmt.prompt_generator.generate_examples.return_value = "SHARED EXAMPLES"
+        gen = SkillGenerator(mock_fmt)
+
+        skill = gen.generate_skill()
+        self.assertEqual(skill.content.count("SHARED EXAMPLES"), 1)
+
+        mock_fmt.prompt_generator.generate_examples.reset_mock()
+        skill_set = gen.generate_skillset()
+        examples_per_skill = [
+            text.count("SHARED EXAMPLES") for text in skill_set.to_dict().values()
+        ]
+        self.assertEqual(sorted(examples_per_skill), [0, 0, 1])
+        # Each catalog's examples are loaded and transformed once.
+        self.assertEqual(mock_fmt.prompt_generator.generate_examples.call_count, 2)
+
+    def test_direct_json_skills_hold_the_protocol_schemas_once(self):
+        """Verifies Direct JSON skills don't repeat the protocol schemas per catalog."""
+        vegachart_path = os.path.join(
+            _repo_root, "catalogs", "vegachart", "v1", "catalog.json"
+        )
+        vegachart = CatalogConfig.from_path(vegachart_path).transformed_catalog
+        fmt = DirectJsonFormat([self.catalog, vegachart])
+        gen = SkillGenerator(fmt)
+        a2r = "### Agent to Renderer Schema:"
+        catalog_section = "### Catalog Schema:"
+
+        mono = gen.generate_skill().content
+        self.assertEqual(mono.count(a2r), 1)
+        self.assertEqual(mono.count(catalog_section), 2)
+
+        skill_set = gen.generate_skillset()
+        core = skill_set["a2ui-core/SKILL.md"].content
+        self.assertEqual(core.count(a2r), 1)
+        self.assertEqual(core.count(catalog_section), 0)
+        catalog_skills = [
+            skill.content
+            for filename, skill in skill_set.items()
+            if filename != "a2ui-core/SKILL.md"
+        ]
+        self.assertEqual(len(catalog_skills), 2)
+        for content in catalog_skills:
+            self.assertEqual(content.count(a2r), 0)
+            self.assertEqual(content.count(catalog_section), 1)
+
+        # The prompt snippet is unchanged: one schema block for every catalog.
+        snippet = fmt.prompt_generator.generate()
+        self.assertEqual(snippet.count(a2r), 1)
+        self.assertEqual(snippet.count(catalog_section), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

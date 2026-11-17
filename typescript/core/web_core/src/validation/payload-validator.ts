@@ -1,0 +1,1114 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import {z} from 'zod';
+import {CatalogInterface} from '../catalog/types.js';
+import {isAtLeastVersion} from '../common/semver.js';
+import {isValidUax31Identifier} from '../common/uax31.js';
+import {A2uiErrorDetail, A2uiValidationError} from '../errors.js';
+import {formatZodIssue} from '../processing/format-zod-issue.js';
+import {getKnownSchemaKeys} from '../resolution/data-context.js';
+import {AccessibilityAttributesSchema, ComponentCommonSchema} from '../types/common-types.js';
+import {
+  AT_COMPONENT_MIXIN_KEYS,
+  ComponentMixinLayout,
+  ComponentMixinValue,
+  SplitComponent,
+  componentMixinLayout,
+  splitComponentEnvelope,
+} from '../catalog/component_envelope.js';
+import {validateMetadata} from '../common/metadata.js';
+import {MAX_FUNCTION_CALL_ARGS} from '../types/helpers.js';
+import {IndexApi} from '../v1_0/functions/system_functions.js';
+import type {ValidationConfig} from './integrity-checker.js';
+import {validateReservedDirectives} from '../resolution/data-context.js';
+
+/**
+ * Looks up a reserved `@`-prefixed system function, which belongs to no
+ * catalog and is available on every v1.0 surface.
+ *
+ * A function rather than a module-level map, because `system_functions` and
+ * this module sit on an import cycle through `data-context`.
+ *
+ * @param name Function name, including its `@` prefix.
+ * @returns The system function's API, or `undefined` if none has that name.
+ */
+function getSystemFunctionApi(name: string): typeof IndexApi | undefined {
+  return name === IndexApi.name ? IndexApi : undefined;
+}
+
+/**
+ * Rejects a call to a reserved `@` system function that names a catalog.
+ *
+ * A system function belongs to no catalog, so a `catalogId` on its call can
+ * never be honored.
+ *
+ * @param name Function name, including its `@` prefix.
+ * @param call Raw function call object.
+ * @throws {A2uiValidationError} If the call carries a `catalogId`.
+ */
+function assertSystemCallNamesNoCatalog(name: string, call: Record<string, unknown>): void {
+  if (call['catalogId'] !== undefined) {
+    throw new A2uiValidationError(
+      `System function '${name}' belongs to no catalog and must not name a catalogId.`,
+    );
+  }
+}
+
+/**
+ * Builds the error message for a v1.0 function call whose `catalogId` is not
+ * a string.
+ *
+ * @param name Name of the function being called.
+ * @returns The error message.
+ */
+export function nonStringCatalogIdMessage(name: string): string {
+  return `Function call '${name}' has a non-string 'catalogId'.`;
+}
+
+/**
+ * Rejects a renderer call to a catalog function whose `allowedCallers` is
+ * `agentOnly`.
+ *
+ * A call held in a component (a property binding, a check or an action) is
+ * made by the renderer. A function whose `allowedCallers` is `agentOnly` runs
+ * only for an agent's `callRendererFunction`, so it can't be bound into a
+ * component. `DataContext` refuses such a call when it is evaluated, with the
+ * same message.
+ *
+ * @param catalog The catalog the call runs in.
+ * @param name The called function.
+ * @throws {A2uiValidationError} If the catalog declares the function
+ *   `agentOnly`. The error names no path; the caller sets the call's location.
+ */
+export function assertRendererMayCall(
+  catalog: {readonly functions: ReadonlyMap<string, {readonly allowedCallers?: string}>},
+  name: string,
+): void {
+  if (catalog.functions.get(name)?.allowedCallers !== 'agentOnly') return;
+  throw new A2uiValidationError(
+    `Function '${name}' cannot be called by renderer (allowedCallers is agentOnly).`,
+  );
+}
+
+/**
+ * Decides whether a v1.0 nested function call runs in its component's catalog.
+ *
+ * A call runs in the catalog it names, or else in the surface's default
+ * catalog. So a call that names no `catalogId` runs in the component's
+ * catalog only when that catalog is the surface default.
+ *
+ * @param callCatalogId The `catalogId` the call names, if any.
+ * @param catalogId ID of the component's catalog.
+ * @param options.catalogIsDefault Whether the component's catalog is the
+ *   surface's default catalog.
+ * @returns Whether the call runs in the component's catalog.
+ */
+export function nestedCallRunsInCatalog(
+  callCatalogId: string | undefined,
+  catalogId: string,
+  {catalogIsDefault}: {catalogIsDefault: boolean},
+): boolean {
+  if (callCatalogId === undefined) {
+    return catalogIsDefault;
+  }
+  return callCatalogId === catalogId;
+}
+
+/**
+ * Validates A2UI payloads against the schemas of a single catalog.
+ *
+ * The validator is deliberately scoped to one catalog. Multi-catalog payloads
+ * are resolved to a target catalog by the caller, which then constructs a
+ * validator for it; that keeps catalog resolution and schema checking in
+ * separate places and mirrors Python's `PayloadValidator`.
+ *
+ * From v1.0 `validateComponent` fully validates a nested function call that
+ * runs in this catalog (see `nestedCallRunsInCatalog`): a call that names
+ * this catalog, or names no `catalogId` in a component that names none
+ * either. Any other call runs in a catalog this validator can't see, so only
+ * its identifiers are checked; `MessageProcessor` resolves such a call's
+ * catalog and checks it there. Any string, the empty string included, names a
+ * catalog, and a non-string `catalogId` on a call is rejected. Reserved `@`
+ * system functions belong to no catalog: they are always validated fully, and
+ * a `catalogId` on one is rejected. A call held in a component is a renderer
+ * call, so a fully checked call may not call an `agentOnly` function (see
+ * `assertRendererMayCall`). Below v1.0, which has no `allowedCallers`, that
+ * check is skipped.
+ *
+ * A component that names no `catalogId` is taken to be in the surface's
+ * default catalog, where calls that name none run, so its catalogless calls
+ * are judged here. `MessageProcessor` knows the surface default and passes a
+ * component's `catalogId` only when its catalog is another one.
+ *
+ * Below v1.0 a call cannot select a catalog, so every nested call is
+ * validated against this catalog whatever `catalogId` it carries.
+ *
+ * Every method throws on failure rather than returning a list of problems.
+ * Python's `validate_component` returns its errors instead, but TypeScript
+ * callers, in particular `MessageProcessor`, depend on an exception to trigger
+ * atomic rollback of a partially applied update.
+ *
+ * Identifier checks apply only to catalogs declaring protocol version 1.0 or
+ * later, matching the version gate Python applies.
+ */
+export class PayloadValidator {
+  /** Whether this catalog's protocol version mandates UAX #31 identifiers. */
+  private readonly enforceIdentifiers: boolean;
+
+  /**
+   * Initializes a new `PayloadValidator`.
+   *
+   * @param catalog Catalog whose schemas define what a valid payload is.
+   * @param config Validation strictness. When omitted, unknown components and
+   *   functions are tolerated.
+   */
+  constructor(
+    private readonly catalog: CatalogInterface<any, any>,
+    private readonly config?: ValidationConfig,
+  ) {
+    this.enforceIdentifiers = isAtLeastVersion(catalog.protocolVersion, '1.0');
+  }
+
+  /**
+   * Whether unrecognized components and functions are tolerated.
+   *
+   * An absent config means the caller is not validating at all, so unknown
+   * elements pass. This preserves the gate `MessageProcessor` applied before
+   * this class existed, and matches Python, whose `validate_components_update`
+   * returns early when `config is None`.
+   */
+  private get allowUnknown(): boolean {
+    return this.config ? (this.config.allowUnknownElements ?? false) : true;
+  }
+
+  /**
+   * Validates a single component payload against its catalog definition,
+   * including any nested function calls within its properties.
+   *
+   * @param comp Raw component payload, including its `id` and `component`
+   *   envelope keys.
+   * @param knownType Component type to assume when the payload omits
+   *   `component`, as happens on a partial update to an existing component.
+   * @param options Validation options. `skipNestedFunctions` leaves the
+   *   function calls in the properties unchecked, as pre-1.0 renderers did
+   *   when validation was off.
+   * @throws {A2uiValidationError} If the identifier, the component type, any
+   *   property, or any nested function call fails validation.
+   */
+  validateComponent(
+    comp: Record<string, unknown>,
+    knownType?: string,
+    options?: {skipNestedFunctions?: boolean},
+  ): void {
+    const id = comp['id'];
+    if (typeof id !== 'string' || !id) {
+      const msg = `Component '${comp['component']}' is missing an 'id'; entries require a valid string 'id'.`;
+      throw new A2uiValidationError(
+        msg,
+        [{path: '/id', code: 'missing_field', message: msg}],
+        'VALIDATION_ERROR',
+        {path: '/id'},
+      );
+    }
+
+    this.assertIdentifier(
+      id,
+      `Component id '${id}' must be a valid UAX #31 identifier`,
+      false,
+      '/id',
+    );
+
+    const declaredType = comp['component'];
+    const componentType = typeof declaredType === 'string' ? declaredType : knownType;
+    if (!componentType) {
+      const msg = `Cannot create component ${id} without a type.`;
+      throw new A2uiValidationError(
+        msg,
+        [{path: '/component', code: 'missing_field', message: msg}],
+        'VALIDATION_ERROR',
+        {path: '/component'},
+      );
+    }
+
+    this.assertIdentifier(
+      componentType,
+      `Component type '${componentType}' must be a valid UAX #31 identifier`,
+      false,
+      '/component',
+    );
+
+    const componentApi = this.catalog.components.get(componentType);
+    // From v1.0 the envelope mixins (`@metadata`, `@catalogId`,
+    // `@accessibility`, `@checks`, or their legacy bare names) are split from
+    // the component's own properties. Below v1.0 every key but `id` and
+    // `component` is a property.
+    const split: SplitComponent = this.enforceIdentifiers
+      ? splitComponentEnvelope(comp, componentMixinLayout(componentApi?.schema))
+      : {properties: stripStructuralKeys(comp), mixins: {}};
+    const properties = split.properties;
+    // Decides which nested calls run in this catalog; see
+    // `nestedCallRunsInCatalog`.
+    const rawCatalogId = split.mixins.catalogId?.value;
+    const componentCatalogId = typeof rawCatalogId === 'string' ? rawCatalogId : undefined;
+
+    if (!componentApi) {
+      if (!this.allowUnknown) {
+        const msg = `Unknown component type '${componentType}' not found in catalog '${this.catalog.id}'.`;
+        throw new A2uiValidationError(
+          msg,
+          [{path: '/component', code: 'invalid_value', message: msg}],
+          'VALIDATION_ERROR',
+          {path: '/component'},
+        );
+      }
+      // The component's properties can't be checked without its schema, but
+      // the function calls in them still run, so they are checked all the
+      // same. `MessageProcessor` relies on this for the calls it leaves to
+      // component validation.
+      this.validateEnvelopeMixins(
+        split.mixins,
+        undefined,
+        properties,
+        componentType,
+        id,
+        componentCatalogId,
+      );
+      if (!options?.skipNestedFunctions) {
+        this.validateNestedFunctions(properties, componentCatalogId);
+      }
+      return;
+    }
+
+    if (this.enforceIdentifiers) {
+      this.validateEnvelopeMixins(
+        split.mixins,
+        componentMixinLayout(componentApi.schema),
+        properties,
+        componentType,
+        id,
+        componentCatalogId,
+      );
+    } else {
+      this.validateLegacyAccessibility(
+        properties,
+        getKnownSchemaKeys(componentApi.schema),
+        componentType,
+        id,
+      );
+    }
+
+    const result = componentApi.schema.safeParse(properties);
+    if (!result.success) {
+      const formattedErrors = result.error.errors.map(formatZodIssue).join(', ');
+      const details = zodIssuesToDetails(result.error.issues);
+      const uniquePaths = new Set(details.map(d => d.path));
+      const firstPath = uniquePaths.size === 1 ? details[0]?.path : undefined;
+      throw new A2uiValidationError(
+        `Validation failed for component '${componentType}' (${id}): ${formattedErrors}`,
+        details,
+        'VALIDATION_ERROR',
+        {path: firstPath && firstPath !== '/' ? firstPath : undefined},
+      );
+    }
+    if (!options?.skipNestedFunctions) {
+      this.validateNestedFunctions(properties, componentCatalogId, '', componentApi.schema);
+    }
+  }
+
+  /**
+   * Validates a pre-1.0 component's `ComponentCommon` `accessibility` when the
+   * component schema does not declare it, removing it from `properties`
+   * before strict component schema parsing.
+   *
+   * Below v1.0 `metadata` and `catalogId` are not part of the protocol, so a
+   * component carrying them is checked against its own schema like any other
+   * property.
+   */
+  private validateLegacyAccessibility(
+    properties: Record<string, unknown>,
+    knownKeys: Set<string> | null | undefined,
+    componentType: string,
+    id: string,
+  ): void {
+    if (!('accessibility' in properties) || knownKeys?.has('accessibility')) return;
+    const accVal = properties['accessibility'];
+    delete properties['accessibility'];
+    this.parseEnvelopeValue(AccessibilityAttributesSchema.optional(), accVal, '/accessibility', {
+      componentType,
+      id,
+    });
+    this.validateNestedFunctions(
+      accVal,
+      undefined,
+      '/accessibility',
+      AccessibilityAttributesSchema,
+    );
+  }
+
+  /**
+   * Validates the v1.0 envelope mixins a component carries.
+   *
+   * A mixin the component's schema declares with its standard schema (such
+   * as `checks` on a `Checkable` component) is put back into `properties`
+   * under that schema's key, so the component schema checks it. Any other
+   * mixin is checked here: `@metadata` against `ComponentCommon` (including
+   * the UAX #31 `extensions` keys), `@catalogId` as a string,
+   * `@accessibility` against `AccessibilityAttributes`. `@checks` is
+   * rejected on a component that is not checkable.
+   *
+   * @param mixins The component's envelope mixins.
+   * @param layout The component's mixin layout, or `undefined` when the
+   *   component type is unknown to the catalog.
+   * @param properties The component's own properties, which this may extend.
+   * @param componentType The component's type, for error messages.
+   * @param id The component's id, for error messages.
+   * @param componentCatalogId The catalog the component names, if any.
+   * @throws {A2uiValidationError} If a mixin is invalid.
+   */
+  private validateEnvelopeMixins(
+    mixins: SplitComponent['mixins'],
+    layout: ComponentMixinLayout | undefined,
+    properties: Record<string, unknown>,
+    componentType: string,
+    id: string,
+    componentCatalogId?: string,
+  ): void {
+    const subject = {componentType, id};
+    for (const [key, mixin] of Object.entries(mixins) as Array<
+      [keyof SplitComponent['mixins'], ComponentMixinValue]
+    >) {
+      const path = `/${mixin.wireKey}`;
+      if (key === 'metadata') {
+        this.parseEnvelopeValue(
+          ComponentCommonSchema.shape['@metadata'],
+          mixin.value,
+          path,
+          subject,
+        );
+        rethrowAt(path, () => validateMetadata(mixin.value));
+      }
+      const schemaKey = layout?.schemaKeys.get(key);
+      if (schemaKey !== undefined) {
+        properties[schemaKey] = mixin.value;
+        continue;
+      }
+      switch (key) {
+        case 'catalogId':
+          if (typeof mixin.value !== 'string') {
+            const msg = `Component '${id}' has a non-string '${mixin.wireKey}'.`;
+            throw new A2uiValidationError(
+              msg,
+              [{path, code: 'invalid_value', message: msg}],
+              'VALIDATION_ERROR',
+              {path},
+            );
+          }
+          break;
+        case 'accessibility':
+          this.parseEnvelopeValue(
+            AccessibilityAttributesSchema.optional(),
+            mixin.value,
+            path,
+            subject,
+          );
+          this.validateNestedFunctions(
+            mixin.value,
+            componentCatalogId,
+            path,
+            AccessibilityAttributesSchema,
+          );
+          break;
+        case 'checks':
+          if (layout) {
+            const msg = `Component '${componentType}' (${id}) is not checkable and does not accept '${mixin.wireKey}'.`;
+            throw new A2uiValidationError(
+              msg,
+              [{path, code: 'invalid_value', message: msg}],
+              'VALIDATION_ERROR',
+              {path},
+            );
+          }
+          this.validateNestedFunctions(mixin.value, componentCatalogId, path);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  /**
+   * Parses an envelope value against its schema.
+   *
+   * @throws {A2uiValidationError} If the value does not satisfy the schema,
+   *   with paths under `path`.
+   */
+  private parseEnvelopeValue(
+    schema: z.ZodTypeAny,
+    value: unknown,
+    path: string,
+    {componentType, id}: {componentType: string; id: string},
+  ): void {
+    const result = schema.safeParse(value);
+    if (result.success) return;
+    const formattedErrors = result.error.errors.map(formatZodIssue).join(', ');
+    const details = zodIssuesToDetails(result.error.issues, path);
+    throw new A2uiValidationError(
+      `Validation failed for component '${componentType}' (${id}): ${formattedErrors}`,
+      details,
+      'VALIDATION_ERROR',
+      {path: details[0]?.path},
+    );
+  }
+
+  /**
+   * Asserts that a v1.0 call's envelope is well formed without consulting its
+   * catalog: the function name and all argument keys satisfy UAX #31
+   * identifier syntax, and `args`, when present, is an object.
+   *
+   * @param name Function name to check.
+   * @param args Function arguments object whose keys are checked.
+   * @throws {A2uiValidationError} If the function name or any argument key is
+   *   not a valid UAX #31 identifier, or `args` is not an object.
+   */
+  private assertFunctionIdentifiers(name: string, args: unknown): void {
+    this.assertIdentifier(name, `Function name '${name}' must be a valid UAX #31 identifier`, true);
+    // The call envelope types `args` as an object, whatever catalog the call
+    // runs in.
+    if (
+      this.enforceIdentifiers &&
+      args !== undefined &&
+      args !== null &&
+      (typeof args !== 'object' || Array.isArray(args))
+    ) {
+      throw new A2uiValidationError(
+        `Validation failed for function '${name}': Expected object, received ${Array.isArray(args) ? 'array' : typeof args}`,
+      );
+    }
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      const keys = Object.keys(args);
+      if (keys.length > MAX_FUNCTION_CALL_ARGS) {
+        throw new A2uiValidationError(
+          `Function call '${name}' exceeds maximum allowed arguments count (${MAX_FUNCTION_CALL_ARGS})`,
+        );
+      }
+      for (const argName of keys) {
+        this.assertIdentifier(
+          argName,
+          `Function argument '${argName}' in function '${name}' must be a valid UAX #31 identifier`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Recursively walks a component's property values and validates any nested
+   * function call objects.
+   *
+   * From v1.0 a call that runs in this catalog (see `nestedCallRunsInCatalog`)
+   * is validated against this catalog. Any other call runs in a catalog this
+   * validator cannot see, so only its envelope (name and argument
+   * identifiers) is checked; `MessageProcessor` validates it against the
+   * catalog it resolves to. A non-string `catalogId` is rejected. Reserved `@`
+   * system functions belong to no catalog and are validated fully.
+   *
+   * @param val Property value or subtree to inspect.
+   * @param componentCatalogId The `catalogId` the component names, if any.
+   * @throws {A2uiValidationError} If any nested function call fails schema or identifier validation.
+   */
+  private checkNestedCallRecord(
+    record: Record<string, unknown>,
+    rawName: string,
+    componentCatalogId: string | undefined,
+    slotSchema?: z.ZodTypeAny,
+  ): void {
+    const rawArgs = record['args'];
+    const argsDict = (rawArgs !== undefined ? rawArgs : {}) as Record<string, unknown>;
+    if (!this.enforceIdentifiers) {
+      // `allowedCallers` arrived in v1.0, so below it a binding may call any
+      // function the catalog declares.
+      this.validateFunction(rawName, argsDict);
+      this.assertPreV10ReturnType(record, rawName, slotSchema);
+      return;
+    }
+    if (rawName.startsWith('@')) {
+      assertSystemCallNamesNoCatalog(rawName, record);
+      this.validateFunction(rawName, argsDict);
+      return;
+    }
+    const callCatalogId = record['catalogId'];
+    if (callCatalogId !== undefined && typeof callCatalogId !== 'string') {
+      throw new A2uiValidationError(nonStringCatalogIdMessage(rawName));
+    }
+    if (
+      nestedCallRunsInCatalog(callCatalogId, this.catalog.id, {
+        catalogIsDefault: componentCatalogId === undefined,
+      })
+    ) {
+      assertRendererMayCall(this.catalog, rawName);
+      this.validateFunction(rawName, argsDict);
+    } else {
+      this.assertFunctionIdentifiers(rawName, argsDict);
+    }
+  }
+
+  /**
+   * Validates a pre-1.0 function call's `returnType` against both the catalog
+   * function definition and the enclosing typed `Dynamic*` slot schema.
+   */
+  private assertPreV10ReturnType(
+    record: Record<string, unknown>,
+    rawName: string,
+    slotSchema?: z.ZodTypeAny,
+  ): void {
+    const fn = this.catalog.functions.get(rawName);
+    const declaredReturnType = record['returnType'];
+    if (
+      declaredReturnType !== undefined &&
+      fn &&
+      fn.returnType !== 'any' &&
+      declaredReturnType !== fn.returnType
+    ) {
+      throw returnTypeError(rawName, fn.returnType, String(declaredReturnType));
+    }
+    const allowedSlotTypes = allowedReturnTypesForSchema(slotSchema);
+    if (!allowedSlotTypes) return;
+    const declaredMismatch =
+      declaredReturnType !== undefined &&
+      (typeof declaredReturnType !== 'string' || !allowedSlotTypes.has(declaredReturnType));
+    const fnMismatch =
+      fn !== undefined && fn.returnType !== 'any' && !allowedSlotTypes.has(fn.returnType);
+    if (declaredMismatch || fnMismatch) {
+      const actualType =
+        declaredReturnType !== undefined ? String(declaredReturnType) : String(fn?.returnType);
+      throw returnTypeError(rawName, [...allowedSlotTypes].join("' | '"), actualType);
+    }
+  }
+
+  private validateNestedFunctions(
+    val: unknown,
+    componentCatalogId: string | undefined,
+    currentPath = '',
+    schema?: z.ZodTypeAny,
+  ): void {
+    if (Array.isArray(val)) {
+      this.validateNestedArray(val, componentCatalogId, currentPath, schema);
+      return;
+    }
+
+    if (typeof val !== 'object' || val === null) {
+      return;
+    }
+
+    const record = val as Record<string, unknown>;
+    if (this.enforceIdentifiers) {
+      this.validateRecordDirectives(record, currentPath);
+    }
+    const rawName = this.enforceIdentifiers
+      ? record['@call']
+      : (record['call'] ?? record['function']);
+    const isCallRecord =
+      typeof rawName === 'string' && (this.enforceIdentifiers || rawName.length > 0);
+    if (isCallRecord) {
+      rethrowAt(currentPath, () =>
+        this.checkNestedCallRecord(record, rawName, componentCatalogId, schema),
+      );
+    }
+
+    this.validateNestedRecordChildren(
+      record,
+      isCallRecord ? rawName : undefined,
+      componentCatalogId,
+      currentPath,
+      schema,
+    );
+  }
+
+  private validateNestedArray(
+    items: readonly unknown[],
+    componentCatalogId: string | undefined,
+    currentPath: string,
+    schema?: z.ZodTypeAny,
+  ): void {
+    const itemSchema = elementSchema(schema);
+    for (let i = 0; i < items.length; i++) {
+      this.validateNestedFunctions(items[i], componentCatalogId, `${currentPath}/${i}`, itemSchema);
+    }
+  }
+
+  private validateRecordDirectives(record: Record<string, unknown>, currentPath: string): void {
+    // The component envelope mixins (`@metadata` and the like) are allowed
+    // at the root of a component only; nested anywhere else they are
+    // unrecognized directives.
+    const keys = Object.keys(record);
+    validateReservedDirectives(
+      currentPath === '' ? keys.filter(key => !AT_COMPONENT_MIXIN_KEYS.has(key)) : keys,
+      this.catalog.protocolVersion,
+    );
+  }
+
+  private validateNestedRecordChildren(
+    record: Record<string, unknown>,
+    callName: string | undefined,
+    componentCatalogId: string | undefined,
+    currentPath: string,
+    schema?: z.ZodTypeAny,
+  ): void {
+    const callArgsSchema =
+      callName !== undefined
+        ? this.resolveCallArgsSchema(record, callName, componentCatalogId)
+        : undefined;
+    const recordSchema = callName === undefined ? narrowRecordSchema(schema, record) : undefined;
+    for (const [k, v] of Object.entries(record)) {
+      const childSchema =
+        callName !== undefined
+          ? k === 'args'
+            ? callArgsSchema
+            : undefined
+          : propertySchema(recordSchema, k, record);
+      this.validateNestedFunctions(v, componentCatalogId, `${currentPath}/${k}`, childSchema);
+    }
+  }
+
+  private resolveCallArgsSchema(
+    record: Record<string, unknown>,
+    rawName: string,
+    componentCatalogId: string | undefined,
+  ): z.ZodTypeAny | undefined {
+    if (!this.enforceIdentifiers) {
+      return this.catalog.functions.get(rawName)?.schema;
+    }
+    if (rawName.startsWith('@')) {
+      return getSystemFunctionApi(rawName)?.schema;
+    }
+    const callCatalogId = record['catalogId'];
+    if (
+      (callCatalogId === undefined || typeof callCatalogId === 'string') &&
+      nestedCallRunsInCatalog(callCatalogId, this.catalog.id, {
+        catalogIsDefault: componentCatalogId === undefined,
+      })
+    ) {
+      return this.catalog.functions.get(rawName)?.schema;
+    }
+    return undefined;
+  }
+
+  /**
+   * Validates the arguments of a function call against the catalog definition.
+   *
+   * @param name Name of the function being called.
+   * @param args Arguments supplied by the payload.
+   * @returns The parsed arguments object (including any schema defaults).
+   * @throws {A2uiValidationError} If the function name, an argument name, or an
+   *   argument value fails validation.
+   */
+  validateFunction(name: string, args?: Record<string, unknown>): Record<string, unknown> {
+    this.assertFunctionIdentifiers(name, args);
+
+    const fn =
+      this.enforceIdentifiers && name.startsWith('@')
+        ? getSystemFunctionApi(name)
+        : this.catalog.functions.get(name);
+    if (!fn) {
+      if (!this.allowUnknown) {
+        throw new A2uiValidationError(`Unrecognized function '${name}'`);
+      }
+      return (args ?? {}) as Record<string, unknown>;
+    }
+
+    if (!fn.schema) {
+      if (
+        args !== undefined &&
+        (typeof args !== 'object' || args === null || Array.isArray(args))
+      ) {
+        throw new A2uiValidationError(
+          `Validation failed for function '${name}': Expected object, received ${Array.isArray(args) ? 'array' : typeof args}`,
+          undefined,
+          'VALIDATION_ERROR',
+          {path: '/args'},
+        );
+      }
+      return (args ?? {}) as Record<string, unknown>;
+    }
+
+    const result = fn.schema.safeParse(args ?? {});
+    if (!result.success) {
+      const formattedErrors = result.error.errors.map(formatZodIssue).join(', ');
+      const details = zodIssuesToDetails(result.error.issues, '/args');
+      throw new A2uiValidationError(
+        `Validation failed for function '${name}': ${formattedErrors}`,
+        details,
+        'VALIDATION_ERROR',
+        {path: details[0]?.path},
+      );
+    }
+    return result.data as Record<string, unknown>;
+  }
+
+  /**
+   * Validates a surface theme against the catalog's theme schema.
+   *
+   * A catalog that declares no theme schema accepts any theme.
+   *
+   * @param theme Theme payload supplied on `createSurface`.
+   * @returns The parsed theme, which a schema may have defaulted or coerced.
+   * @throws {A2uiValidationError} If the theme does not satisfy the schema.
+   */
+  validateTheme(theme: unknown): unknown {
+    const themeSchema = this.catalog.themeSchema;
+    if (!themeSchema) return theme;
+
+    const result = themeSchema.safeParse(theme);
+    if (!result.success) {
+      const formattedErrors = result.error.errors.map(formatZodIssue).join(', ');
+      const details = zodIssuesToDetails(result.error.issues, '/theme');
+      throw new A2uiValidationError(
+        `Validation failed for theme: ${formattedErrors}`,
+        details,
+        'VALIDATION_ERROR',
+        {path: details[0]?.path ?? '/theme'},
+      );
+    }
+    return result.data;
+  }
+
+  /**
+   * Asserts that an identifier is valid if identifier enforcement is enabled.
+   *
+   * @param name Identifier to check.
+   * @param message Error message to use when validation fails.
+   * @param allowLeadingAt Whether a leading `@` is permitted.
+   * @param path Optional JSON Pointer path for error context.
+   * @throws {A2uiValidationError} If identifier enforcement is active and `name` is invalid.
+   */
+  private assertIdentifier(
+    name: string,
+    message: string,
+    allowLeadingAt = false,
+    path?: string,
+  ): void {
+    if (!this.enforceIdentifiers) return;
+    if (!isValidUax31Identifier(name, allowLeadingAt)) {
+      throw new A2uiValidationError(
+        message,
+        path ? [{path, code: 'invalid_value', message}] : undefined,
+        'VALIDATION_ERROR',
+        {path},
+      );
+    }
+  }
+}
+
+/**
+ * Converts Zod validation issues into structured `A2uiErrorDetail` entries.
+ */
+function zodIssuesToDetails(issues: readonly z.ZodIssue[], prefix = ''): A2uiErrorDetail[] {
+  return issues.map(issue => {
+    const segments = issue.path.map(s => String(s).replace(/~/g, '~0').replace(/\//g, '~1'));
+    if (
+      issue.code === 'unrecognized_keys' &&
+      'keys' in issue &&
+      Array.isArray(issue.keys) &&
+      issue.keys.length > 0
+    ) {
+      segments.push(String(issue.keys[0]).replace(/~/g, '~0').replace(/\//g, '~1'));
+    }
+    const relPath = segments.length > 0 ? `/${segments.join('/')}` : '';
+    const fullPath = `${prefix}${relPath}` || '/';
+    const isMissing =
+      (issue.code === 'invalid_type' && 'received' in issue && issue.received === 'undefined') ||
+      issue.message === 'Required';
+    return {
+      path: fullPath,
+      code: isMissing ? 'missing_field' : 'invalid_value',
+      message: issue.message,
+    };
+  });
+}
+
+/**
+ * Strips the structural `id` and `component` keys from a pre-1.0 component
+ * payload, returning only component properties.
+ *
+ * Below v1.0 `metadata` and `catalogId` are not envelope fields, so a
+ * component that declares them keeps them as properties.
+ *
+ * @param comp Raw component payload.
+ * @returns New object without `id` or `component`.
+ */
+function stripStructuralKeys(comp: Record<string, unknown>): Record<string, unknown> {
+  const {id: _id, component: _component, ...properties} = comp;
+  return properties;
+}
+
+/**
+ * Runs `check`, prefixing the path of any `A2uiValidationError` it throws.
+ *
+ * @param path JSON Pointer of the value `check` validates.
+ * @param check The check to run.
+ */
+function rethrowAt(path: string, check: () => void): void {
+  try {
+    check();
+  } catch (err: unknown) {
+    if (err instanceof A2uiValidationError) {
+      err.path = err.path && err.path !== '/' ? `${path}${err.path}` : path;
+    }
+    throw err;
+  }
+}
+
+function returnTypeError(rawName: string, expected: string, received: string): A2uiValidationError {
+  const msg = `Validation failed for function '${rawName}': Expected returnType '${expected}', received '${received}'`;
+  return new A2uiValidationError(
+    msg,
+    [{path: '/returnType', code: 'invalid_value', message: msg}],
+    'VALIDATION_ERROR',
+    {path: '/returnType'},
+  );
+}
+
+const DYNAMIC_TYPE_REF =
+  /^REF:[^|#]*#\/\$defs\/(DynamicString|DynamicNumber|DynamicBoolean|DynamicStringList|DynamicValue)(?:\||$)/;
+
+const EXPECTED_DYNAMIC_RETURN_TYPES: Readonly<Record<string, string>> = {
+  DynamicString: 'string',
+  DynamicNumber: 'number',
+  DynamicBoolean: 'boolean',
+  DynamicStringList: 'array',
+  DynamicValue: 'any',
+};
+
+/** Unwraps one layer of Zod modifier (`optional`, `default`, `effects`, `lazy`, etc.). */
+function innerZodSchema(schema: z.ZodTypeAny): z.ZodTypeAny | undefined {
+  const def = schema._def as {
+    typeName?: string;
+    innerType?: z.ZodTypeAny;
+    schema?: z.ZodTypeAny;
+    type?: z.ZodTypeAny;
+    out?: z.ZodTypeAny;
+    getter?: () => z.ZodTypeAny;
+  };
+  switch (def.typeName) {
+    case 'ZodOptional':
+    case 'ZodNullable':
+    case 'ZodDefault':
+    case 'ZodCatch':
+    case 'ZodReadonly':
+      return def.innerType;
+    case 'ZodBranded':
+      return def.type;
+    case 'ZodEffects':
+      return def.schema;
+    case 'ZodPipeline':
+      return def.out;
+    case 'ZodLazy':
+      return def.getter?.();
+    default:
+      return undefined;
+  }
+}
+
+/** Unwraps all outer Zod modifiers down to the structural schema node. */
+function unwrapZodSchema(schema: z.ZodTypeAny | undefined): z.ZodTypeAny | undefined {
+  let current = schema;
+  for (
+    let next = current && innerZodSchema(current);
+    next;
+    next = current && innerZodSchema(current)
+  ) {
+    current = next;
+  }
+  return current;
+}
+
+/** Returns the `Dynamic*` return type tag on `schema` or its outer wrappers, if any. */
+function directDynamicReturnType(schema: z.ZodTypeAny | undefined): string | undefined {
+  for (let current = schema; current; current = innerZodSchema(current)) {
+    const desc = current.description;
+    const match = typeof desc === 'string' ? DYNAMIC_TYPE_REF.exec(desc) : null;
+    if (match) return EXPECTED_DYNAMIC_RETURN_TYPES[match[1]];
+  }
+  return undefined;
+}
+
+/**
+ * Returns the set of allowed `FunctionCall.returnType` values for a typed
+ * `Dynamic*` slot schema, or `undefined` if the slot does not constrain the
+ * function call return type.
+ */
+function allowedReturnTypesForSchema(
+  schema: z.ZodTypeAny | undefined,
+): ReadonlySet<string> | undefined {
+  const direct = directDynamicReturnType(schema);
+  if (direct !== undefined) {
+    return direct === 'any' ? undefined : new Set([direct]);
+  }
+  const core = unwrapZodSchema(schema);
+  const def = core?._def as
+    | {
+        typeName?: string;
+        options?: z.ZodTypeAny[];
+        left?: z.ZodTypeAny;
+        right?: z.ZodTypeAny;
+      }
+    | undefined;
+  if (def?.typeName === 'ZodIntersection' && def.left && def.right) {
+    return allowedReturnTypesForSchema(def.left) ?? allowedReturnTypesForSchema(def.right);
+  }
+  if (
+    (def?.typeName === 'ZodUnion' || def?.typeName === 'ZodDiscriminatedUnion') &&
+    Array.isArray(def.options)
+  ) {
+    return allowedReturnTypesForUnion(def.options);
+  }
+  return undefined;
+}
+
+function allowedReturnTypesForUnion(
+  options: readonly z.ZodTypeAny[],
+): ReadonlySet<string> | undefined {
+  const types = new Set<string>();
+  for (const opt of options) {
+    if (directDynamicReturnType(opt) === 'any') return undefined;
+    const branchTypes = allowedReturnTypesForSchema(opt);
+    if (branchTypes) {
+      for (const t of branchTypes) types.add(t);
+    }
+  }
+  return types.size > 0 ? types : undefined;
+}
+
+function combineSchemas(schemas: readonly z.ZodTypeAny[]): z.ZodTypeAny | undefined {
+  if (schemas.length === 0) return undefined;
+  if (schemas.length === 1) return schemas[0];
+  return z.union(schemas as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+}
+
+/** Returns the item schema of an array schema, if any. */
+function elementSchema(schema: z.ZodTypeAny | undefined): z.ZodTypeAny | undefined {
+  const core = unwrapZodSchema(schema);
+  if (!core) return undefined;
+  const def = core._def as {typeName?: string; type?: z.ZodTypeAny; options?: z.ZodTypeAny[]};
+  if (def.typeName === 'ZodArray') {
+    return def.type;
+  }
+  if (
+    (def.typeName === 'ZodUnion' || def.typeName === 'ZodDiscriminatedUnion') &&
+    Array.isArray(def.options) &&
+    directDynamicReturnType(schema) === undefined
+  ) {
+    const matches = def.options
+      .map(opt => elementSchema(opt))
+      .filter((item): item is z.ZodTypeAny => item !== undefined);
+    return combineSchemas(matches);
+  }
+  return undefined;
+}
+
+/** Returns the property schema for `key` on an object/record/union schema, if any. */
+function propertySchema(
+  schema: z.ZodTypeAny | undefined,
+  key: string,
+  record?: Record<string, unknown>,
+): z.ZodTypeAny | undefined {
+  const core = unwrapZodSchema(schema);
+  if (!core) return undefined;
+  const def = core._def as {
+    typeName?: string;
+    shape?: () => Record<string, z.ZodTypeAny>;
+    valueType?: z.ZodTypeAny;
+    left?: z.ZodTypeAny;
+    right?: z.ZodTypeAny;
+    options?: z.ZodTypeAny[];
+  };
+  switch (def.typeName) {
+    case 'ZodObject': {
+      const shape = def.shape?.();
+      return shape && typeof shape === 'object' ? shape[key] : undefined;
+    }
+    case 'ZodRecord':
+      return def.valueType;
+    case 'ZodIntersection':
+      return propertySchema(def.right, key, record) ?? propertySchema(def.left, key, record);
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion':
+      return unionPropertySchema(schema, core, def.options, key, record);
+    default:
+      return undefined;
+  }
+}
+
+function narrowUnionOptions(
+  core: z.ZodTypeAny,
+  options: readonly z.ZodTypeAny[],
+  record?: Record<string, unknown>,
+): readonly z.ZodTypeAny[] {
+  if (!record) return options;
+  const def = core._def as {
+    typeName?: string;
+    discriminator?: string;
+    optionsMap?: Map<unknown, z.ZodTypeAny>;
+  };
+  if (
+    def.typeName === 'ZodDiscriminatedUnion' &&
+    typeof def.discriminator === 'string' &&
+    def.optionsMap instanceof Map
+  ) {
+    const match = def.optionsMap.get(record[def.discriminator]);
+    return match ? [match] : options;
+  }
+  const matching = options.filter(opt => opt.safeParse(record).success);
+  return matching.length > 0 ? matching : options;
+}
+
+function narrowRecordSchema(
+  schema: z.ZodTypeAny | undefined,
+  record: Record<string, unknown>,
+): z.ZodTypeAny | undefined {
+  const core = unwrapZodSchema(schema);
+  if (!core || directDynamicReturnType(schema) !== undefined) {
+    return schema;
+  }
+  const def = core._def as {
+    typeName?: string;
+    options?: z.ZodTypeAny[];
+  };
+  if (
+    (def.typeName === 'ZodUnion' || def.typeName === 'ZodDiscriminatedUnion') &&
+    Array.isArray(def.options)
+  ) {
+    return combineSchemas(narrowUnionOptions(core, def.options, record));
+  }
+  return core;
+}
+
+function unionPropertySchema(
+  schema: z.ZodTypeAny | undefined,
+  core: z.ZodTypeAny,
+  options: readonly z.ZodTypeAny[] | undefined,
+  key: string,
+  record?: Record<string, unknown>,
+): z.ZodTypeAny | undefined {
+  if (!Array.isArray(options) || directDynamicReturnType(schema) !== undefined) {
+    return undefined;
+  }
+  const active = narrowUnionOptions(core, options, record);
+  const matches = active
+    .map(opt => propertySchema(opt, key, record))
+    .filter((found): found is z.ZodTypeAny => found !== undefined);
+  return combineSchemas(matches);
+}
