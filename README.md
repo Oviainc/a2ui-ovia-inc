@@ -1,3 +1,15 @@
+# Ovia Inc — A2UI fork
+
+![Ovia Inc — Gallery of A2UI rendered cards from the upstream project assets](docs/assets/a2ui_gallery_examples.png)
+
+> **Ovia Inc fork of [a2ui-project/a2ui](https://github.com/a2ui-project/a2ui).**
+>
+> **Modifications by Ovia Inc:** this reference note, added November 2026 as part of the collection-wide documentation pass. In November 2026 we synced this fork with upstream and aligned the README to upstream before re-applying this header. The expanded Ovia README treatment (Ovia section, story, topics and description) follows in the daily improvement queue.
+>
+> Upstream code and content are otherwise unchanged from upstream except where a later commit says so. Credit to the upstream A2UI project and its contributors; the upstream project is licensed under the Apache-2.0 license.
+
+---
+
 # A2UI
 
 **Build delightful, fast, reliable agentic experiences**
